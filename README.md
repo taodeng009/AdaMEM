@@ -7,9 +7,11 @@
 <p align="center">
   <b>ICML 2026</b>
   &nbsp;|&nbsp;
-  <a href="https://arxiv.org/abs/XXXX.XXXXX">Paper</a>
+  <a href="https://arxiv.org/pdf/2606.05684">Paper</a>
   &nbsp;|&nbsp;
   <a href="https://github.com/yunx-z/AdaMEM">Code</a>
+  &nbsp;|&nbsp;
+  <a href="https://yunx-z.github.io/AdaMEM/">Project Page</a>
 </p>
 
 ---
