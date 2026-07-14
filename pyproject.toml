@@ -1,87 +1,60 @@
-# -------------------------------
-# build-system
-# -------------------------------
 [build-system]
-requires = [
-    "setuptools>=61.0",
-    "wheel"
-]
+requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
-# -------------------------------
-# project (PEP 621 metadata)
-# -------------------------------
 [project]
-name = "verl"
-# We'll mark the version as "dynamic" because it's read from the file "verl/version/version" 
-# (PEP 621 calls this "dynamic version"). 
-# The actual version is specified in the [tool.setuptools.dynamic] section below.
-dynamic = ["version", "dependencies", "optional-dependencies", "authors", "urls"]
-
-description = "verl: Volcano Engine Reinforcement Learning for LLM"
-license = {file = "LICENSE"}  # or "Apache-2.0", if you prefer an SPDX identifier
-readme = {file = "README.md", content-type = "text/markdown"}
-requires-python = ">=3.8"
-
-# -------------------------------
-# tool.ruff - Linting configuration
-# -------------------------------
-[tool.ruff]
-# Note: While the formatter will attempt to format lines such that they remain within the line-length,
-# it isn't a hard upper bound, and formatted lines may exceed the line-length.
-line-length = 300 # TODO: Reduce this to a more reasonable value
-
-[tool.ruff.lint]
-isort = {known-first-party = ["verl"]}
-# c.f. https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
-select = [
-    # pycodestyle
-    "E",
-    # Pyflakes
-    "F",
-    # pyupgrade
-    "UP",
-    # flake8-bugbear
-    "B",
-    # isort
-    "I",
-    "G",
+name = "adamem-agent"
+version = "0.1.0"
+description = "Adaptive Memory Agent (AdaMEM) for long-horizon language-agent tasks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  {name = "AdaMEM authors"},
 ]
-ignore = [
-    # star imports
-    "F405", "F403",
-    # lambda expression assignment
-    "E731",
-    # Loop control variable not used within loop body
-    "B007",
-    # f-string format
-    "UP032",
-    # Can remove once 3.10+ is the minimum Python version
-    "UP007",
-    # `.log()` statement uses f-string
-    "G004",
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "hnswlib>=0.8.0",
+  "httpx>=0.27.0",
+  "numpy>=1.24.0",
+  "omegaconf>=2.3.0",
+  "openai>=1.30.0",
+  "PyYAML>=6.0",
+  "ray[default]>=2.41.0,<2.50.0",
+  "requests>=2.31.0",
+  "torch>=2.2.0",
+  "tqdm>=4.66.0",
+  "transformers>=4.45.0,<5.0.0",
 ]
 
-# -------------------------------
-# tool.setuptools - Additional config
-# -------------------------------
-[tool.setuptools]
-# True means `setuptools` will attempt to include all relevant files in package_data automatically.
-# This corresponds to `include_package_data=True` in setup.py.
-include-package-data = true
+[project.optional-dependencies]
+# Dependencies required by the text-only ALFWorld experiments in this repo.
+alfworld = [
+  "alfworld>=0.4.0",
+  "gymnasium==0.29.1",
+  "stable-baselines3==2.6.0",
+  "torchvision>=0.17.0",
+]
+dev = [
+  "build>=1.2.0",
+  "pytest>=8.0.0",
+]
 
-# We read the version from a file in 'verl/version/version'
-[tool.setuptools.dynamic]
-version = {file = "verl/version/version"}
+[project.urls]
+Homepage = "https://github.com/yunx-z/AdaMEM"
+Repository = "https://github.com/yunx-z/AdaMEM"
 
-# If you need to mimic `package_dir={'': '.'}`:
-[tool.setuptools.package-dir]
-"" = "."
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_system*", "examples*"]
+namespaces = true
 
-# If you need to include specific non-Python data (like YAML files or version file):
-# This is the rough equivalent of package_data={'': ['version/*'], 'verl': ['trainer/config/*.yaml']}
 [tool.setuptools.package-data]
-verl = [
-  "version/*",
-  "trainer/config/*.yaml"
-]
+"agent_system.environments.env_package.alfworld" = ["configs/*.yaml"]

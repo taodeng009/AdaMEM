@@ -42,14 +42,38 @@ A central challenge for language agents is utilizing past experience to adapt to
 ```bash
 git clone https://github.com/yunx-z/AdaMEM.git
 cd AdaMEM
-pip install -e .
-pip install -r requirements.txt
+
+# Create an isolated environment (Python 3.10-3.12 recommended).
+python -m venv .venv
+source .venv/bin/activate  # Windows PowerShell: .venv\Scripts\Activate.ps1
+
+# Install AdaMEM with the dependencies used by the ALFWorld experiments.
+python -m pip install --upgrade pip
+python -m pip install -e ".[alfworld]"
 ```
 
-Install the ALFWorld and WebShop environments by following the setup instructions in the verl-agent repo:
+Download the ALFWorld PDDL/game data after installing the package:
 
-- **ALFWorld**: https://github.com/langfengQ/verl-agent#1-alfworld
+```bash
+alfworld-download -f
+```
+
+The text-only ALFWorld path above does not require vLLM in the same environment:
+the inference script talks to any OpenAI-compatible model server over HTTP. If
+you want to host the model locally with vLLM, use a Linux/WSL environment with
+a supported NVIDIA GPU and install vLLM separately.
+
+For other environments, follow the setup instructions in the verl-agent repo:
+
 - **WebShop**: https://github.com/langfengQ/verl-agent#2-webshop
+
+Alternative requirements-file installation (equivalent dependencies, but not
+the AdaMEM package itself):
+
+```bash
+python -m pip install -r requirements-alfworld.txt
+python -m pip install -e . --no-deps
+```
 
 ---
 

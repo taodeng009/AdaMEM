@@ -1,0 +1,8 @@
+# ALFWorld-specific dependencies. Install the core project first, or use:
+#   pip install -e ".[alfworld]"
+-r requirements.txt
+alfworld>=0.4.0
+gymnasium==0.29.1
+stable-baselines3==2.6.0
+torchvision>=0.17.0
+
