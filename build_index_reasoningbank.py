@@ -190,7 +190,7 @@ Your output must strictly follow the Markdown format below:
     print("sample value", values[10])
     print(f"num of entries: {len(keys)}")
 
-    emb = embed_texts(keys, model="Qwen/Qwen3-Embedding-4B", normalize=True)
+    emb = embed_texts(keys, normalize=True)
     emb = torch.tensor(emb, dtype=torch.float32)
     emb = emb.cpu().contiguous().numpy().astype("float32")
     d = emb.shape[1]
@@ -219,5 +219,4 @@ Your output must strictly follow the Markdown format below:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 

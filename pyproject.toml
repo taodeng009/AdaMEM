@@ -26,6 +26,7 @@ dependencies = [
   "numpy>=1.24.0",
   "omegaconf>=2.3.0",
   "openai>=1.30.0",
+  "python-dotenv>=1.0.0",
   "PyYAML>=6.0",
   "ray[default]>=2.41.0,<2.50.0",
   "requests>=2.31.0",

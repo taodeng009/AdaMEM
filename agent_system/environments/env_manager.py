@@ -19,10 +19,13 @@ import torch
 import numpy as np
 from functools import partial
 import os
+from agent_system.config import load_project_env
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
+
+load_project_env()
 
 if os.environ.get("MEM_TYPE", None):
     from utils import get_top_k_memories, get_top_k_memories_mix, is_mix_mode

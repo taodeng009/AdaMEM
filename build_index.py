@@ -122,7 +122,7 @@ print(f"Key 0: {keys[0]}")
 print(f"Value 0: {values[0]}")
 print(f"num of entries: {len(keys)}")
 
-emb = embed_texts(keys, model="Qwen/Qwen3-Embedding-4B", normalize=True)
+emb = embed_texts(keys, normalize=True)
 emb = torch.tensor(emb, dtype=torch.float32)
 emb = emb.cpu().contiguous().numpy().astype("float32")
 d = emb.shape[1]
@@ -150,5 +150,4 @@ with open(meta_path, "w") as f:
 
 with open(values_path, "wb") as f:
     pickle.dump(values, f)
-
 

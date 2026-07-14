@@ -12,13 +12,25 @@ import ray
 
 import requests
 
-EMB_VLLM_SERVER = os.environ["EMB_VLLM_SERVER"]
-BASE_URL = f"http://{EMB_VLLM_SERVER}:8002/v1"
+from agent_system.config import load_project_env
+
+load_project_env()
+
+# EMBEDDING_BASE_URL is the preferred setting and includes scheme, port and /v1.
+# Keep EMB_VLLM_SERVER as a backward-compatible host-only fallback.
+BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "").rstrip("/")
+if not BASE_URL:
+    emb_vllm_server = os.environ.get("EMB_VLLM_SERVER", "127.0.0.1")
+    BASE_URL = f"http://{emb_vllm_server}:8002/v1"
+
+EMBEDDING_MODEL_NAME = os.environ.get(
+    "EMBEDDING_MODEL_NAME", "Qwen/Qwen3-Embedding-4B"
+)
 API_KEY  = "EMPTY"
 
 def embed_texts(
     texts,
-    model="Qwen/Qwen3-Embedding-4B",
+    model=None,
     normalize=True,
     timeout=600,
     batch_size=256,
@@ -33,6 +45,7 @@ def embed_texts(
     if len(texts) == 0:
         raise ValueError("texts must not be empty")
 
+    model = model or EMBEDDING_MODEL_NAME
     url = f"{BASE_URL}/embeddings"
     headers = {"Authorization": f"Bearer {API_KEY}"}
 

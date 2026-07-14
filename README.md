@@ -52,6 +52,14 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[alfworld]"
 ```
 
+Create the local runtime configuration. AdaMEM loads `.env` from the repository
+root automatically; variables already exported by the shell take precedence.
+
+```bash
+cp .env.example .env
+# Edit .env and set ALFWORLD_DATA and the model server addresses.
+```
+
 Download the ALFWorld PDDL/game data after installing the package:
 
 ```bash
@@ -134,6 +142,10 @@ Set `MEM_TYPE` to any value from the table above. Omit `MEM_TYPE` (or set it emp
 | `MEM_TYPE` | `None` | Memory mechanism (see table above) |
 | `MODEL_NAME` | `Qwen/Qwen3-4B-Instruct-2507` | Policy model served by vLLM |
 | `STRATEGY_MODEL_NAME` | same as `MODEL_NAME` | Strategy synthesis model (can differ from policy for off-policy setup) |
+| `OPENAI_BASE_IP_ADDR_STRATEGY` | same as `OPENAI_BASE_IP_ADDR` | Strategy model server; may differ from the policy server |
+| `EMBEDDING_MODEL_NAME` | `Qwen/Qwen3-Embedding-4B` | Model used for both index construction and retrieval queries |
+| `EMBEDDING_BASE_URL` | `http://$EMB_VLLM_SERVER:8002/v1` | Full OpenAI-compatible embedding endpoint |
+| `MEMORY_MODEL_NAME` | — | Index namespace/source trajectory model; not a serving endpoint |
 | `RETRIEVAL_TOPK` | `1` | Number of retrieved experiences *k* |
 | `OPENAI_BASE_IP_ADDR` | `127.0.0.1` | vLLM server host:port |
 

@@ -1,0 +1,7 @@
+.env
+.venv/
+data/
+logs/
+retrieval_data/
+__pycache__/
+*.py[cod]
