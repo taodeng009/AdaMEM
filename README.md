@@ -143,6 +143,10 @@ Set `MEM_TYPE` to any value from the table above. Omit `MEM_TYPE` (or set it emp
 | `MODEL_NAME` | `Qwen/Qwen3-4B-Instruct-2507` | Policy model served by vLLM |
 | `STRATEGY_MODEL_NAME` | same as `MODEL_NAME` | Strategy synthesis model (can differ from policy for off-policy setup) |
 | `OPENAI_BASE_IP_ADDR_STRATEGY` | same as `OPENAI_BASE_IP_ADDR` | Strategy model server; may differ from the policy server |
+| `POLICY_BACKEND` | `BACKEND` or `vllm` | Policy backend: `vllm` or `openai` |
+| `STRATEGY_BACKEND` | same as policy | Strategy backend: `vllm`, `openai`, or `openai-compatible` |
+| `STRATEGY_BASE_URL` | OpenAI default | Full third-party strategy API base URL, including `/v1` |
+| `STRATEGY_API_KEY` | `OPENAI_API_KEY` | API key used only by the strategy client |
 | `EMBEDDING_MODEL_NAME` | `Qwen/Qwen3-Embedding-4B` | Model used for both index construction and retrieval queries |
 | `EMBEDDING_BASE_URL` | `http://$EMB_VLLM_SERVER:8002/v1` | Full OpenAI-compatible embedding endpoint |
 | `MEMORY_MODEL_NAME` | — | Index namespace/source trajectory model; not a serving endpoint |

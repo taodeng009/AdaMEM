@@ -229,7 +229,10 @@ def build_env(env_name, env_num=1, start_idx=0):
 class Agent:
     def __init__(self, model_name=MODEL_NAME):
         self.model_name = model_name
-        self.backend = os.environ.get("BACKEND", "vllm")  # 'vllm' or 'openai'
+        # BACKEND remains a backward-compatible alias for POLICY_BACKEND.
+        self.backend = os.environ.get(
+            "POLICY_BACKEND", os.environ.get("BACKEND", "vllm")
+        )
         
         if self.backend == "openai":
             self.api_key = os.environ.get("OPENAI_API_KEY")
@@ -262,25 +265,61 @@ class Agent:
 
         # Strategy model setup (separate from policy model when MEM_TYPE includes "step_strategy")
         self.strategy_model_name = os.environ.get("STRATEGY_MODEL_NAME", self.model_name)
-        
-        if self.backend == "openai":
-            # For OpenAI, strategy uses same client but different model
-            self.strategy_client = self.client
-            self.strategy_max_tokens = 4096
-            logging.info(f"Strategy model initialized with OpenAI backend, model {self.strategy_model_name}, max_tokens {self.strategy_max_tokens}")
-        else:  # vllm
-            strategy_ip_addrs_str = os.environ.get("OPENAI_BASE_IP_ADDR_STRATEGY", ip_addrs_str)
+        self.strategy_backend = os.environ.get("STRATEGY_BACKEND", self.backend)
+        self.strategy_max_tokens = int(os.environ.get("STRATEGY_MAX_TOKENS", "4096"))
+
+        if self.strategy_backend in {"openai", "openai-compatible"}:
+            strategy_api_key = os.environ.get(
+                "STRATEGY_API_KEY", os.environ.get("OPENAI_API_KEY")
+            )
+            if not strategy_api_key:
+                raise ValueError(
+                    "STRATEGY_API_KEY (or OPENAI_API_KEY) must be set when "
+                    f"STRATEGY_BACKEND={self.strategy_backend}"
+                )
+
+            strategy_base_url = os.environ.get("STRATEGY_BASE_URL", "").strip()
+            if self.strategy_backend == "openai-compatible" and not strategy_base_url:
+                raise ValueError(
+                    "STRATEGY_BASE_URL must be set for an OpenAI-compatible strategy API"
+                )
+
+            client_kwargs = {"api_key": strategy_api_key}
+            if strategy_base_url:
+                client_kwargs["base_url"] = strategy_base_url.rstrip("/")
+            self.strategy_client = AsyncOpenAI(**client_kwargs)
+            self.strategy_semaphore = asyncio.Semaphore(
+                int(os.environ.get("STRATEGY_MAX_CONCURRENCY", "10"))
+            )
+            logging.info(
+                "Strategy model initialized with %s backend, model %s, base_url=%s, max_tokens=%s",
+                self.strategy_backend,
+                self.strategy_model_name,
+                strategy_base_url or "OpenAI default",
+                self.strategy_max_tokens,
+            )
+        elif self.strategy_backend == "vllm":
+            strategy_ip_addrs_str = os.environ.get(
+                "OPENAI_BASE_IP_ADDR_STRATEGY",
+                os.environ.get("OPENAI_BASE_IP_ADDR", "127.0.0.1"),
+            )
             self.strategy_ip_addrs = [ip.strip() for ip in strategy_ip_addrs_str.split(",")]
             print("DEBUG: using strategy vllm ip addresses", self.strategy_ip_addrs)
-            
+
+            strategy_api_key = os.environ.get("STRATEGY_API_KEY", self.api_key)
             # Create persistent clients for strategy model
             self.strategy_clients = {
-                ip: AsyncOpenAI(api_key=self.api_key, base_url=f"http://{ip}/v1")
+                ip: AsyncOpenAI(api_key=strategy_api_key, base_url=f"http://{ip}/v1")
                 for ip in self.strategy_ip_addrs
             }
-
-            self.strategy_max_tokens = 8192 if self.strategy_model_name == "Qwen/Qwen3-4B-Thinking-2507" else 2048
+            if "STRATEGY_MAX_TOKENS" not in os.environ:
+                self.strategy_max_tokens = 8192 if self.strategy_model_name == "Qwen/Qwen3-4B-Thinking-2507" else 2048
             logging.info(f"Strategy model initialized with vLLM backend, model {self.strategy_model_name}, max_tokens {self.strategy_max_tokens}")
+        else:
+            raise ValueError(
+                "Unsupported STRATEGY_BACKEND. Expected one of: "
+                "vllm, openai, openai-compatible"
+            )
 
         # State for strategy reuse across steps
         self.active_strategies = {}  # env_idx -> current strategy string
@@ -528,18 +567,28 @@ class Agent:
     
     async def get_strategy_from_gpt(self, obs):
         start_time = time.time()
-        if self.backend == "openai":
+        if self.strategy_backend in {"openai", "openai-compatible"}:
             async def _api_call():
-                async with self.semaphore:
-                    resp = await self.strategy_client.chat.completions.create(
+                request_kwargs = dict(
                         model=self.strategy_model_name,
                         messages=[{"role": "user", "content": obs}],
-                        max_completion_tokens=self.strategy_max_tokens,
+                )
+                if self.strategy_backend == "openai":
+                    request_kwargs["max_completion_tokens"] = self.strategy_max_tokens
+                else:
+                    request_kwargs["max_tokens"] = self.strategy_max_tokens
+                    request_kwargs["temperature"] = self.temperature
+
+                async with self.strategy_semaphore:
+                    resp = await self.strategy_client.chat.completions.create(
+                        **request_kwargs
                     )
                 self.track_api_cost(resp)
                 ret = resp.choices[0].message.content.strip()
                 if not ret:
-                    raise RuntimeError(f"Empty response from OpenAI strategy for prompt: {obs}")
+                    raise RuntimeError(
+                        f"Empty response from {self.strategy_backend} strategy API"
+                    )
                 return ret
             
             result = await self._retry_api_call(_api_call)
