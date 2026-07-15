@@ -641,7 +641,7 @@ class Agent:
         """
         # Stage 1: Get initial response
         initial_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_WITH_OPTIONAL_MEMORY
-        initial_response = await self.get_action_from_gpt(initial_prompt)
+        initial_response, initial_action_time = await self.get_action_from_gpt(initial_prompt)
 
         # Extract initial action
         initial_action = extract_action_from_response(initial_response)
@@ -655,7 +655,9 @@ class Agent:
                 from utils import get_top_k_memories
                 
                 # Retrieve memories based on current observation
+                retrieval_start = time.time()
                 top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
+                retrieval_time = time.time() - retrieval_start
                 retrieved_exp = "\n\n".join([
                     f"Retrieved Item {idx}:\n{content}" 
                     for idx, (content, relevance_score) in enumerate(top_k_memories)
@@ -666,7 +668,7 @@ class Agent:
                     k=topk,
                     retrieved_exp=retrieved_exp
                 )
-                strategy_response = await self.get_strategy_from_gpt(strategy_prompt)
+                strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
                 strategy = extract_strategy_from_response(strategy_response)
                 
                 if not strategy_response:
@@ -676,7 +678,7 @@ class Agent:
                 action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                     strategy=strategy if strategy else "[No strategy provided]"
                 )
-                final_response = await self.get_action_from_gpt(action_prompt)
+                final_response, final_action_time = await self.get_action_from_gpt(action_prompt)
                 final_action = extract_action_from_response(final_response)
                 
                 # Debug: Check if final_response is empty
@@ -697,7 +699,12 @@ class Agent:
                     "action_prompt": action_prompt,
                     "final_response": final_response,
                     "final_action": final_action,
-                    "action_changed": action_changed
+                    "action_changed": action_changed,
+                    "timing_info": {
+                        "retrieval_time": retrieval_time,
+                        "strategy_time": strategy_time,
+                        "action_time": initial_action_time + final_action_time,
+                    },
                 }
                 
                 return final_response, True, reason, retrieval_info
@@ -713,7 +720,12 @@ class Agent:
                     "action_prompt": None,
                     "final_response": None,
                     "final_action": initial_action,
-                    "action_changed": False
+                    "action_changed": False,
+                    "timing_info": {
+                        "retrieval_time": 0.0,
+                        "strategy_time": 0.0,
+                        "action_time": initial_action_time,
+                    },
                 }
                 return initial_response, False, "", retrieval_info
         else:
@@ -728,7 +740,12 @@ class Agent:
                 "action_prompt": None,
                 "final_response": None,
                 "final_action": initial_action,
-                "action_changed": False
+                "action_changed": False,
+                "timing_info": {
+                    "retrieval_time": 0.0,
+                    "strategy_time": 0.0,
+                    "action_time": initial_action_time,
+                },
             }
             return initial_response, False, "", retrieval_info
     
@@ -757,7 +774,9 @@ class Agent:
             from utils import get_top_k_memories
             
             # Always retrieve memories based on current observation
+            retrieval_start = time.time()
             top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
+            retrieval_time = time.time() - retrieval_start
             retrieved_exp = "\n\n".join([
                 f"Retrieved Item {idx}:\n{content}" 
                 for idx, (content, relevance_score) in enumerate(top_k_memories)
@@ -768,7 +787,7 @@ class Agent:
                 k=topk,
                 retrieved_exp=retrieved_exp
             )
-            strategy_response = await self.get_strategy_from_gpt(strategy_prompt)
+            strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
             strategy = extract_strategy_from_response(strategy_response)
             
             if not strategy_response:
@@ -778,7 +797,7 @@ class Agent:
             action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                 strategy=strategy if strategy else "[No strategy provided]"
             )
-            final_response = await self.get_action_from_gpt(action_prompt)
+            final_response, action_time = await self.get_action_from_gpt(action_prompt)
             final_action = extract_action_from_response(final_response)
             
             # Debug: Check if final_response is empty
@@ -793,13 +812,18 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
+                "timing_info": {
+                    "retrieval_time": retrieval_time,
+                    "strategy_time": strategy_time,
+                    "action_time": action_time,
+                },
             }
             
             return final_response, True, "always_retrieve", retrieval_info
         except Exception as e:
             logging.warning(f"Three-stage every step memory retrieval failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
-            direct_response = await self.get_action_from_gpt(prompt)
+            direct_response, direct_time = await self.get_action_from_gpt(prompt)
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
                 "strategy_prompt": None,
@@ -808,6 +832,11 @@ class Agent:
                 "action_prompt": None,
                 "final_response": direct_response,
                 "final_action": direct_action,
+                "timing_info": {
+                    "retrieval_time": 0.0,
+                    "strategy_time": 0.0,
+                    "action_time": direct_time,
+                },
             }
             return direct_response, False, "", retrieval_info
     
@@ -834,7 +863,7 @@ class Agent:
         try:
             # Stage 1: Generate strategy directly without retrieval
             strategy_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_STRATEGY_NO_RETRIEVAL
-            strategy_response = await self.get_strategy_from_gpt(strategy_prompt)
+            strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
             strategy = extract_strategy_from_response(strategy_response)
             
             if not strategy_response:
@@ -844,7 +873,7 @@ class Agent:
             action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                 strategy=strategy if strategy else "[No strategy provided]"
             )
-            final_response = await self.get_action_from_gpt(action_prompt)
+            final_response, action_time = await self.get_action_from_gpt(action_prompt)
             final_action = extract_action_from_response(final_response)
             
             # Debug: Check if final_response is empty
@@ -859,13 +888,18 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
+                "timing_info": {
+                    "retrieval_time": 0.0,
+                    "strategy_time": strategy_time,
+                    "action_time": action_time,
+                },
             }
             
             return final_response, False, "no_retrieval", retrieval_info
         except Exception as e:
             logging.warning(f"Three-stage no retrieval failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
-            direct_response = await self.get_action_from_gpt(prompt)
+            direct_response, direct_time = await self.get_action_from_gpt(prompt)
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
                 "strategy_prompt": None,
@@ -874,6 +908,11 @@ class Agent:
                 "action_prompt": None,
                 "final_response": direct_response,
                 "final_action": direct_action,
+                "timing_info": {
+                    "retrieval_time": 0.0,
+                    "strategy_time": 0.0,
+                    "action_time": direct_time,
+                },
             }
             return direct_response, False, "", retrieval_info
     
@@ -902,7 +941,9 @@ class Agent:
             from utils import get_top_k_memories
             
             # Always retrieve memories based on current observation
+            retrieval_start = time.time()
             top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
+            retrieval_time = time.time() - retrieval_start
             retrieved_exp = "\n\n".join([
                 f"Retrieved Item {idx}:\n{content}" 
                 for idx, (content, relevance_score) in enumerate(top_k_memories)
@@ -912,7 +953,7 @@ class Agent:
             action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_DIRECT_ACTION_FROM_RETRIEVAL.format(
                 retrieved_exp=retrieved_exp
             )
-            final_response = await self.get_action_from_gpt(action_prompt)
+            final_response, action_time = await self.get_action_from_gpt(action_prompt)
             final_action = extract_action_from_response(final_response)
             
             # Debug: Check if final_response is empty
@@ -924,6 +965,11 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
+                "timing_info": {
+                    "retrieval_time": retrieval_time,
+                    "strategy_time": 0.0,
+                    "action_time": action_time,
+                },
             }
             
             return final_response, True, "always_retrieve", retrieval_info
@@ -937,12 +983,12 @@ class Agent:
                 "final_response": direct_response,
                 "final_action": direct_action,
             }
-            timing_info = {
+            retrieval_info["timing_info"] = {
                 "retrieval_time": 0.0,
                 "strategy_time": 0.0,
-                "action_time": direct_time
+                "action_time": direct_time,
             }
-            return direct_response, False, "", retrieval_info, timing_info
+            return direct_response, False, "", retrieval_info
     
     async def get_action_with_adamem_low(
         self, 
@@ -1398,6 +1444,7 @@ async def main():
                             retrieval_requests[idx] = requested
                             retrieval_reasons[idx] = reason
                             retrieval_infos[idx] = retrieval_info
+                            step_timings[idx] = retrieval_info["timing_info"]
                         
                         # Track retrieval statistics
                         num_requested = sum(retrieval_requests)
@@ -1440,6 +1487,7 @@ async def main():
                             retrieval_requests[idx] = requested
                             retrieval_reasons[idx] = reason
                             retrieval_infos[idx] = retrieval_info
+                            step_timings[idx] = retrieval_info["timing_info"]
                         
                         # Track retrieval statistics
                         num_requested = sum(retrieval_requests)
@@ -1480,6 +1528,7 @@ async def main():
                             retrieval_requests[idx] = requested
                             retrieval_reasons[idx] = reason
                             retrieval_infos[idx] = retrieval_info
+                            step_timings[idx] = retrieval_info["timing_info"]
                         
                         # Track retrieval statistics (no retrieval, so all zero)
                         num_requested = 0
@@ -1517,6 +1566,7 @@ async def main():
                             retrieval_requests[idx] = requested
                             retrieval_reasons[idx] = reason
                             retrieval_infos[idx] = retrieval_info
+                            step_timings[idx] = retrieval_info["timing_info"]
                         
                         # Track retrieval statistics
                         num_requested = sum(retrieval_requests)
