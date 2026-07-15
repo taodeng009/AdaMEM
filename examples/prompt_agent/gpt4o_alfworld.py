@@ -12,6 +12,8 @@ import random
 import re
 import shutil
 import httpx
+from index_config import resolve_retrieval_mode
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 from datetime import datetime
@@ -34,9 +36,9 @@ SPLIT2ENV_NUM = {'train' : int(os.environ.get("EVAL_BATCH_SIZE", 150)), 'eval_in
 # SPLIT2ENV_NUM = {'train' : 5000, 'eval_in_distribution' : 10, 'eval_out_of_distribution' : 10} # for eval env_num should equal game cnt for deterministic eval; for train no need (random sample with replacement)
 mem_type = os.environ.get("MEM_TYPE", None)
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
-_correct_only_val = os.environ.get("CORRECT_ONLY", "false").lower()
-correct_only = _correct_only_val == "true"
-mix_mode = _correct_only_val == "mix"
+_retrieval_mode = resolve_retrieval_mode(os.environ.get("CORRECT_ONLY"))
+correct_only = _retrieval_mode == "correct_only"
+mix_mode = _retrieval_mode == "mix"
 
 
 def _parse_env_int(name: str, default: int, minimum: int = 1) -> int:

@@ -95,8 +95,7 @@ Collect successful trajectories on the training split first (see Step 3 below fo
 # Step-level index (used by all AdaMEM variants)
 python build_index.py \
   --dataset_name alfworld \
-  --base_model_name Qwen/Qwen3-4B-Instruct-2507 \
-  --correct_only
+  --base_model_name Qwen/Qwen3-4B-Instruct-2507
 
 # Episode-level index (for synapse baseline)
 python build_index_traj_level.py \
@@ -108,6 +107,11 @@ python build_index_reasoningbank.py \
   --dataset_name alfworld \
   --base_model_name Qwen/Qwen3-4B-Instruct-2507
 ```
+
+All index builders use successful trajectories by default. Use
+`--failure_only` or `--all_trajectories` only for explicit ablations. At
+inference time, `CORRECT_ONLY` likewise defaults to `true`; set it to `false`
+for the all-trajectory index or `mix` for separate success/failure indexes.
 
 ### 2. Run Inference
 

@@ -13,6 +13,7 @@ import httpx
 from tqdm.asyncio import tqdm
 
 from utils import embed_texts
+from index_config import resolve_index_filters
 from trajectory_io import resolve_trajectory_file
 
 # Parse command-line arguments
@@ -20,14 +21,15 @@ parser = argparse.ArgumentParser(description='Build index for dataset')
 parser.add_argument('--dataset_name', type=str, required=True, help='Name of the dataset')
 parser.add_argument('--base_model_name', type=str, required=True, help='Name of the base model')
 parser.add_argument('--traj_file', type=str, default=None, help='Trajectory JSON path or glob; defaults to the newest logs/<dataset>/<model>/traj_train*.json')
-parser.add_argument('--correct_only', action='store_true', help='Only index successful episodes')
+parser.add_argument('--correct_only', action='store_true', help='Only index successful episodes (default)')
 parser.add_argument('--failure_only', action='store_true', help='Only index failed episodes')
+parser.add_argument('--all_trajectories', action='store_true', help='Index both successful and failed episodes')
 args = parser.parse_args()
-if args.correct_only and args.failure_only:
-    raise ValueError("--correct_only and --failure_only are mutually exclusive")
-
-correct_only = args.correct_only
-failure_only = args.failure_only
+correct_only, failure_only = resolve_index_filters(
+    correct_only=args.correct_only,
+    failure_only=args.failure_only,
+    all_trajectories=args.all_trajectories,
+)
 
 # -------------------------------
 # 1) Your key/value data

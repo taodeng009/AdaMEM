@@ -14,6 +14,7 @@ import requests
 
 from agent_system.config import load_project_env
 from agent_system.memory.types import normalize_memory_type
+from index_config import resolve_retrieval_mode
 
 load_project_env()
 
@@ -83,7 +84,8 @@ def embed_texts(
     return X
 
 mem_type = os.environ.get("MEM_TYPE", None)
-is_mix_mode = os.environ.get("CORRECT_ONLY", "false").lower() == "mix"
+retrieval_mode = resolve_retrieval_mode(os.environ.get("CORRECT_ONLY"))
+is_mix_mode = retrieval_mode == "mix"
 
 
 def _get_file_paths(memory_type=None, split=None):
@@ -125,8 +127,8 @@ def _get_file_paths(memory_type=None, split=None):
         effective_correct = False
         effective_failure = True
     else:
-        # Use env var (backward compat).
-        effective_correct = os.environ.get("CORRECT_ONLY", "false").lower() == "true"
+        # The paper and index builders default to successful trajectories.
+        effective_correct = retrieval_mode == "correct_only"
         effective_failure = False
 
     if effective_failure:
