@@ -1542,7 +1542,10 @@ async def main():
                         # Build recent history for each env (last 3 steps)
                         recent_histories = []
                         for idx in active_indices:
-                            steps = trajs[idx]["steps"]
+                            # Trajectories are local to the current environment batch.
+                            # `trajs` does not exist in this scope; using it caused
+                            # AdaMEM-LOW to fail with NameError on its first step.
+                            steps = batch_trajs[idx]["steps"]
                             if len(steps) >= 3:
                                 recent = steps[-3:]
                             else:

@@ -6,11 +6,13 @@ import json
 import argparse
 
 from utils import embed_texts
+from trajectory_io import resolve_trajectory_file
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Build index for dataset')
 parser.add_argument('--dataset_name', type=str, required=True, help='Name of the dataset')
 parser.add_argument('--base_model_name', type=str, required=True, help='Name of the base model')
+parser.add_argument('--traj_file', type=str, default=None, help='Trajectory JSON path or glob; defaults to the newest logs/<dataset>/<model>/traj_train*.json')
 parser.add_argument('--step_stride', type=int, default=1, help='Keep one entry every K steps (default: 1)')
 parser.add_argument('--correct_only', action='store_true', help='Only index successful episodes')
 parser.add_argument('--failure_only', action='store_true', help='Only index failed episodes')
@@ -30,7 +32,7 @@ dataset_name = args.dataset_name
 base_model_name = args.base_model_name
 # Sanitize base_model_name for file paths
 base_model_safe = base_model_name.replace('/', '_')
-traj_file = f"logs/{dataset_name}_old/{base_model_safe}/traj_train.json"
+traj_file = resolve_trajectory_file(dataset_name, base_model_name, args.traj_file)
 retrieval_data_path = f"retrieval_data/{dataset_name}/{base_model_safe}"
 os.makedirs(retrieval_data_path, exist_ok=True)
 index_path = f"{retrieval_data_path}/train_hnsw.index"
@@ -150,4 +152,3 @@ with open(meta_path, "w") as f:
 
 with open(values_path, "wb") as f:
     pickle.dump(values, f)
-
