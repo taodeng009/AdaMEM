@@ -1016,11 +1016,6 @@ class Agent:
             retrieval_info contains detailed info from stages
             timing_info contains {retrieval_time, strategy_time, action_time}
         """
-        # Generate initial action without strategy guidance
-        direct_prompt = prompt + "\n\n" + ALFWORLD_ACTION_INSTR
-        direct_response, direct_time = await self.get_action_from_gpt(direct_prompt)
-        initial_action = extract_action_from_response(direct_response)
-        
         try:
             current_strategy = self.active_strategies.get(env_idx, None)
             
@@ -1053,8 +1048,7 @@ class Agent:
                 strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(strategy_prompt)
                 new_strategy = extract_strategy_from_response(strategy_response)
                 
-                # Strategy time includes both initial action (counts as thinking) and strategy generation
-                strategy_time = direct_time + strategy_gen_time
+                strategy_time = strategy_gen_time
                 
                 if not new_strategy:
                     logging.warning(f"Env {env_idx}: Empty strategy_response after regeneration!")
@@ -1075,9 +1069,9 @@ class Agent:
                 
                 # Package retrieval information
                 retrieval_info = {
-                    "direct_prompt": direct_prompt,
-                    "initial_response": direct_response,
-                    "initial_action": initial_action,
+                    "direct_prompt": None,
+                    "initial_response": None,
+                    "initial_action": None,
                     "refresh_decision": True,
                     "refresh_reason": "No existing strategy",
                     "refresh_response": None,
@@ -1107,11 +1101,12 @@ class Agent:
                 initial_action_from_combined, should_refresh, refresh_reason = parse_action_and_refresh(combined_response)
                 
                 if not should_refresh:
-                    # Reuse strategy - initial action time counts as action generation
+                    # The combined response is both the refresh decision and the
+                    # executable action, so no separate direct action is needed.
                     retrieval_info = {
-                        "direct_prompt": direct_prompt,
-                        "initial_response": direct_response,
-                        "initial_action": initial_action,
+                        "direct_prompt": None,
+                        "initial_response": combined_response,
+                        "initial_action": initial_action_from_combined,
                         "refresh_decision": should_refresh,
                         "refresh_reason": refresh_reason,
                         "refresh_response": combined_response,
@@ -1127,7 +1122,7 @@ class Agent:
                     timing_info = {
                         "retrieval_time": 0.0,
                         "strategy_time": 0.0,
-                        "action_time": direct_time  # Only initial action time
+                        "action_time": combined_time
                     }
                     
                     return combined_response, False, "strategy_reused", retrieval_info, timing_info
@@ -1160,8 +1155,9 @@ class Agent:
                     strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(strategy_prompt)
                     new_strategy = extract_strategy_from_response(strategy_response)
                     
-                    # Strategy time includes initial action + strategy generation
-                    strategy_time = direct_time + strategy_gen_time
+                    # The combined call produced the tentative action and the
+                    # refresh decision; include it in refresh overhead.
+                    strategy_time = combined_time + strategy_gen_time
                     
                     if not new_strategy:
                         logging.warning(f"Env {env_idx}: Empty strategy_response after regeneration!")
@@ -1182,9 +1178,9 @@ class Agent:
                     
                     # Package retrieval information
                     retrieval_info = {
-                        "direct_prompt": direct_prompt,
-                        "initial_response": direct_response,
-                        "initial_action": initial_action,
+                        "direct_prompt": None,
+                        "initial_response": combined_response,
+                        "initial_action": initial_action_from_combined,
                         "refresh_decision": should_refresh,
                         "refresh_reason": refresh_reason,
                         "refresh_response": combined_response,
@@ -1206,6 +1202,9 @@ class Agent:
                     return final_response, True, "strategy_refreshed", retrieval_info, timing_info
         except Exception as e:
             logging.warning(f"Step strategy reuse failed for env {env_idx}: {e}. Using direct action.")
+            direct_prompt = prompt + "\n\n" + ALFWORLD_ACTION_INSTR
+            direct_response, direct_time = await self.get_action_from_gpt(direct_prompt)
+            initial_action = extract_action_from_response(direct_response)
             retrieval_info = {
                 "direct_prompt": direct_prompt,
                 "initial_response": direct_response,
