@@ -23,6 +23,7 @@ from agent_system.config import load_project_env
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
+from agent_system.memory.types import normalize_memory_type
 from omegaconf import OmegaConf
 
 load_project_env()
@@ -189,7 +190,7 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config, mem_type=None, topk=1):
         self.memory = SimpleMemory()
-        self.memory_type = mem_type
+        self.memory_type = normalize_memory_type(mem_type)
         self.top_k = topk
         super().__init__(envs, projection_f, config)
     
@@ -293,12 +294,16 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     retrieved_exp=retrieved_exp
                 )
                 obs += reflection
-            elif self.memory_type in ["trajectory_as_examplar_episode", "trajectory_as_examplar_episode_correct_only"]:
+            elif self.memory_type == "synapse":
                 if is_mix_mode:
-                    success_mems, failure_mems = get_top_k_memories_mix(self.tasks[i], topk=self.top_k)
+                    success_mems, failure_mems = get_top_k_memories_mix(
+                        self.tasks[i], topk=self.top_k, memory_type="synapse"
+                    )
                     top_k_memories = sorted(success_mems + failure_mems, key=lambda x: x[1], reverse=True)
                 else:
-                    top_k_memories = get_top_k_memories(self.tasks[i], topk=self.top_k)
+                    top_k_memories = get_top_k_memories(
+                        self.tasks[i], topk=self.top_k, memory_type="synapse"
+                    )
                 retrieved_exp = "\n\n".join([f"Retrieved Item {idx}:\n{content}" for idx, (content, relevance_score) in enumerate(top_k_memories)])
                 retrieval_max_chars = compute_dynamic_retrieval_max_chars(obs)
                 retrieved_exp = truncate_middle_text(retrieved_exp, retrieval_max_chars)
@@ -502,7 +507,7 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
 class WebshopEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config, mem_type=None, topk=1):
         self.memory = SimpleMemory()
-        self.memory_type = mem_type
+        self.memory_type = normalize_memory_type(mem_type)
         self.top_k = topk
         super().__init__(envs, projection_f, config)
     
@@ -729,12 +734,16 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 #         available_actions=reformatted_available_actions
                 #     )
             
-            if self.memory_type in ["trajectory_as_examplar_episode", "trajectory_as_examplar_episode_correct_only"]:
+            if self.memory_type == "synapse":
                 if is_mix_mode:
-                    success_mems, failure_mems = get_top_k_memories_mix(self.tasks[i], topk=self.top_k)
+                    success_mems, failure_mems = get_top_k_memories_mix(
+                        self.tasks[i], topk=self.top_k, memory_type="synapse"
+                    )
                     top_k_memories = sorted(success_mems + failure_mems, key=lambda x: x[1], reverse=True)
                 else:
-                    top_k_memories = get_top_k_memories(self.tasks[i], topk=self.top_k)
+                    top_k_memories = get_top_k_memories(
+                        self.tasks[i], topk=self.top_k, memory_type="synapse"
+                    )
                 retrieved_exp = "\n\n".join([f"Retrieved Item {idx}:\n{content}" for idx, (content, relevance_score) in enumerate(top_k_memories)])
                 retrieval_max_chars = compute_dynamic_retrieval_max_chars(obs)
                 retrieved_exp = truncate_middle_text(retrieved_exp, retrieval_max_chars)

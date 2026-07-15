@@ -13,6 +13,7 @@ import ray
 import requests
 
 from agent_system.config import load_project_env
+from agent_system.memory.types import normalize_memory_type
 
 load_project_env()
 
@@ -94,7 +95,7 @@ def _get_file_paths(memory_type=None, split=None):
     dataset_name = os.environ["ENV_NAME"] # alfworld or webshop
     base_model_name = os.environ["MEMORY_MODEL_NAME"] # the model used for generating trajectory memory
     base_model_safe = base_model_name.replace('/', '_')
-    selected_mem_type = memory_type or mem_type
+    selected_mem_type = normalize_memory_type(memory_type or mem_type)
 
     if selected_mem_type is None:
         return None, None, None
@@ -143,7 +144,7 @@ def get_detailed_instruct(task_description: str, query: str) -> str:
 
 
 def _get_task_instruction(memory_type=None):
-    selected_mem_type = memory_type or mem_type
+    selected_mem_type = normalize_memory_type(memory_type or mem_type)
     if selected_mem_type == "reasoningbank":
         return "Given a task description and initial state of an agent, retrieve relevant strategies that can help solve the task."
     return "Given a task state of an agent, retrieve relevant states that are similar to the current one and may help solve the current task."
@@ -196,7 +197,7 @@ _retrieval_lock = threading.Lock()
 
 def _get_retrieval_service(memory_type=None, split=None):
     """Get or create a retrieval service actor for the requested memory type and split."""
-    selected_mem_type = memory_type or mem_type
+    selected_mem_type = normalize_memory_type(memory_type or mem_type)
 
     if selected_mem_type is None:
         return None
@@ -216,7 +217,7 @@ def _get_retrieval_service(memory_type=None, split=None):
 
 def get_top_k_memories(query_state, topk=1, memory_type=None, split=None):
     """Get top-k memories using a centralized retrieval service."""
-    selected_mem_type = memory_type or mem_type
+    selected_mem_type = normalize_memory_type(memory_type or mem_type)
 
     if selected_mem_type is None:
         return []
