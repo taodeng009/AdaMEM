@@ -20,6 +20,16 @@ SCRIPT = (
 
 def _load_low_method(*, should_refresh):
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
+    timing_helpers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {
+            "_timing_call",
+            "_summarize_timing_calls",
+            "_set_wall_clock_time",
+        }
+    ]
     method = next(
         node
         for node in ast.walk(tree)
@@ -42,7 +52,11 @@ def _load_low_method(*, should_refresh):
         "topk": 1,
     }
     exec(
-        compile(ast.Module(body=[method], type_ignores=[]), str(SCRIPT), "exec"),
+        compile(
+            ast.Module(body=[*timing_helpers, method], type_ignores=[]),
+            str(SCRIPT),
+            "exec",
+        ),
         namespace,
     )
     return namespace["get_action_with_adamem_low"]
@@ -81,6 +95,74 @@ class AdaMemLowRegressionTest(unittest.TestCase):
         self.assertIn("batch_trajs", loaded_names)
         self.assertNotIn("trajs", loaded_names)
 
+    def test_timing_summary_separates_call_time_and_wall_clock(self):
+        namespace = {}
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
+        helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "_timing_call",
+                "_summarize_timing_calls",
+                "_sample_std",
+            }
+        ]
+        namespace["np"] = __import__("numpy")
+        exec(
+            compile(ast.Module(body=helpers, type_ignores=[]), str(SCRIPT), "exec"),
+            namespace,
+        )
+        call = namespace["_timing_call"]
+        summarize = namespace["_summarize_timing_calls"]
+        timing = summarize(
+            [
+                call("retrieve", "retrieval", 0.1),
+                call("strategy", "strategy", 0.4),
+                call("action", "action", 0.2),
+            ],
+            wall_clock_time=0.5,
+        )
+
+        self.assertAlmostEqual(timing["model_time"], 0.6)
+        self.assertAlmostEqual(timing["total_time"], 0.7)
+        self.assertAlmostEqual(timing["wall_clock_time"], 0.5)
+        self.assertEqual(len(timing["calls"]), 3)
+        self.assertEqual(namespace["_sample_std"]([0.5]), 0.0)
+
+    def test_all_adamem_modes_emit_call_based_timing(self):
+        tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
+        method_names = {
+            "get_action_with_adamem_high",
+            "get_action_with_adamem_max",
+            "get_action_with_adamem_max_without_trajectory",
+            "get_action_with_adamem_max_without_strategy",
+            "get_action_with_adamem_low",
+        }
+        methods = {
+            node.name: node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in method_names
+        }
+
+        self.assertEqual(set(methods), method_names)
+        for method_name, method in methods.items():
+            summarizes_calls = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_summarize_timing_calls"
+                for node in ast.walk(method)
+            )
+            with self.subTest(method_name=method_name):
+                self.assertTrue(summarizes_calls)
+
+    def test_main_loop_records_concurrent_wall_clock(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("action_batch_start = time.perf_counter()", source)
+        self.assertIn("_set_wall_clock_time(", source)
+        self.assertIn('"wall_clock_time": instance_wall_clock_time', source)
+        self.assertIn('"calls": instance_calls', source)
+
 
 class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
     async def test_initial_strategy_makes_one_action_model_call(self):
@@ -114,6 +196,10 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.strategy_calls), 1)
         self.assertTrue(result[1])
         self.assertEqual(result[4]["strategy_time"], 0.5)
+        self.assertEqual(
+            [call["name"] for call in result[4]["calls"]],
+            ["memory_retrieval", "strategy_synthesis", "strategy_guided_action"],
+        )
 
     async def test_reused_strategy_makes_one_action_model_call(self):
         method = _load_low_method(should_refresh=False)
@@ -134,6 +220,7 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result[1])
         self.assertEqual(result[3]["final_action"], "tentative action")
         self.assertEqual(result[4]["action_time"], 0.25)
+        self.assertEqual(len(result[4]["calls"]), 1)
 
     async def test_refreshed_strategy_makes_only_required_calls(self):
         method = _load_low_method(should_refresh=True)
@@ -166,6 +253,8 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent.strategy_calls), 1)
         self.assertTrue(result[1])
         self.assertEqual(result[4]["strategy_time"], 0.75)
+        self.assertAlmostEqual(result[4]["model_time"], 1.0)
+        self.assertEqual(len(result[4]["calls"]), 4)
 
 
 if __name__ == "__main__":

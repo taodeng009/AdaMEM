@@ -88,6 +88,49 @@ def truncate_middle_text(text: str, max_chars: int, marker: str = "\n... [trunca
     return text[:head] + marker + text[-tail:]
 
 
+def _timing_call(name: str, category: str, duration: float) -> dict:
+    """Describe one completed retrieval or model call."""
+    return {
+        "name": name,
+        "category": category,
+        "duration": max(float(duration), 0.0),
+    }
+
+
+def _summarize_timing_calls(calls, wall_clock_time: float = 0.0) -> dict:
+    """Build additive per-instance timing totals from the calls that occurred."""
+    normalized_calls = [dict(call) for call in calls]
+    category_totals = {"retrieval": 0.0, "strategy": 0.0, "action": 0.0}
+    for call in normalized_calls:
+        category = call.get("category")
+        if category in category_totals:
+            category_totals[category] += max(float(call.get("duration", 0.0)), 0.0)
+
+    model_time = category_totals["strategy"] + category_totals["action"]
+    total_time = category_totals["retrieval"] + model_time
+    return {
+        "retrieval_time": category_totals["retrieval"],
+        "strategy_time": category_totals["strategy"],
+        "action_time": category_totals["action"],
+        "model_time": model_time,
+        "total_time": total_time,
+        "wall_clock_time": max(float(wall_clock_time), 0.0),
+        "calls": normalized_calls,
+    }
+
+
+def _set_wall_clock_time(timing_info: dict, wall_clock_time: float) -> dict:
+    """Attach concurrent wall-clock latency without changing additive call time."""
+    timing_info = dict(timing_info)
+    timing_info["wall_clock_time"] = max(float(wall_clock_time), 0.0)
+    return timing_info
+
+
+def _sample_std(values) -> float:
+    """Return sample standard deviation without NaN for a one-item smoke test."""
+    return float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+
+
 topk = _parse_env_int("RETRIEVAL_TOPK", 1, minimum=1)
 MODEL_CONTEXT_WINDOW_TOKENS = _parse_env_int("MODEL_CONTEXT_WINDOW_TOKENS", 131072, minimum=1024)
 PROMPT_CHAR_PER_TOKEN = _parse_env_float("PROMPT_CHAR_PER_TOKEN", 4.0, minimum=1.0)
@@ -644,6 +687,7 @@ class Agent:
         # Stage 1: Get initial response
         initial_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_WITH_OPTIONAL_MEMORY
         initial_response, initial_action_time = await self.get_action_from_gpt(initial_prompt)
+        timing_calls = [_timing_call("initial_action", "action", initial_action_time)]
 
         # Extract initial action
         initial_action = extract_action_from_response(initial_response)
@@ -660,6 +704,7 @@ class Agent:
                 retrieval_start = time.time()
                 top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
                 retrieval_time = time.time() - retrieval_start
+                timing_calls.append(_timing_call("memory_retrieval", "retrieval", retrieval_time))
                 retrieved_exp = "\n\n".join([
                     f"Retrieved Item {idx}:\n{content}" 
                     for idx, (content, relevance_score) in enumerate(top_k_memories)
@@ -671,6 +716,7 @@ class Agent:
                     retrieved_exp=retrieved_exp
                 )
                 strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
+                timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_time))
                 strategy = extract_strategy_from_response(strategy_response)
                 
                 if not strategy_response:
@@ -681,6 +727,7 @@ class Agent:
                     strategy=strategy if strategy else "[No strategy provided]"
                 )
                 final_response, final_action_time = await self.get_action_from_gpt(action_prompt)
+                timing_calls.append(_timing_call("final_action", "action", final_action_time))
                 final_action = extract_action_from_response(final_response)
                 
                 # Debug: Check if final_response is empty
@@ -702,11 +749,7 @@ class Agent:
                     "final_response": final_response,
                     "final_action": final_action,
                     "action_changed": action_changed,
-                    "timing_info": {
-                        "retrieval_time": retrieval_time,
-                        "strategy_time": strategy_time,
-                        "action_time": initial_action_time + final_action_time,
-                    },
+                    "timing_info": _summarize_timing_calls(timing_calls),
                 }
                 
                 return final_response, True, reason, retrieval_info
@@ -723,11 +766,7 @@ class Agent:
                     "final_response": None,
                     "final_action": initial_action,
                     "action_changed": False,
-                    "timing_info": {
-                        "retrieval_time": 0.0,
-                        "strategy_time": 0.0,
-                        "action_time": initial_action_time,
-                    },
+                    "timing_info": _summarize_timing_calls(timing_calls),
                 }
                 return initial_response, False, "", retrieval_info
         else:
@@ -743,11 +782,7 @@ class Agent:
                 "final_response": None,
                 "final_action": initial_action,
                 "action_changed": False,
-                "timing_info": {
-                    "retrieval_time": 0.0,
-                    "strategy_time": 0.0,
-                    "action_time": initial_action_time,
-                },
+                "timing_info": _summarize_timing_calls(timing_calls),
             }
             return initial_response, False, "", retrieval_info
     
@@ -771,6 +806,7 @@ class Agent:
             (final_action, retrieval_requested, retrieval_reason, retrieval_info)
             retrieval_info contains detailed info from all stages
         """
+        timing_calls = []
         try:
             # Import here to avoid circular dependency
             from utils import get_top_k_memories
@@ -779,6 +815,7 @@ class Agent:
             retrieval_start = time.time()
             top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
             retrieval_time = time.time() - retrieval_start
+            timing_calls.append(_timing_call("memory_retrieval", "retrieval", retrieval_time))
             retrieved_exp = "\n\n".join([
                 f"Retrieved Item {idx}:\n{content}" 
                 for idx, (content, relevance_score) in enumerate(top_k_memories)
@@ -790,6 +827,7 @@ class Agent:
                 retrieved_exp=retrieved_exp
             )
             strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
+            timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_time))
             strategy = extract_strategy_from_response(strategy_response)
             
             if not strategy_response:
@@ -800,6 +838,7 @@ class Agent:
                 strategy=strategy if strategy else "[No strategy provided]"
             )
             final_response, action_time = await self.get_action_from_gpt(action_prompt)
+            timing_calls.append(_timing_call("final_action", "action", action_time))
             final_action = extract_action_from_response(final_response)
             
             # Debug: Check if final_response is empty
@@ -814,11 +853,7 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
-                "timing_info": {
-                    "retrieval_time": retrieval_time,
-                    "strategy_time": strategy_time,
-                    "action_time": action_time,
-                },
+                "timing_info": _summarize_timing_calls(timing_calls),
             }
             
             return final_response, True, "always_retrieve", retrieval_info
@@ -826,6 +861,7 @@ class Agent:
             logging.warning(f"Three-stage every step memory retrieval failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
             direct_response, direct_time = await self.get_action_from_gpt(prompt)
+            timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
                 "strategy_prompt": None,
@@ -834,11 +870,7 @@ class Agent:
                 "action_prompt": None,
                 "final_response": direct_response,
                 "final_action": direct_action,
-                "timing_info": {
-                    "retrieval_time": 0.0,
-                    "strategy_time": 0.0,
-                    "action_time": direct_time,
-                },
+                "timing_info": _summarize_timing_calls(timing_calls),
             }
             return direct_response, False, "", retrieval_info
     
@@ -862,10 +894,12 @@ class Agent:
             (final_action, retrieval_requested, retrieval_reason, retrieval_info)
             retrieval_info contains detailed info from stages
         """
+        timing_calls = []
         try:
             # Stage 1: Generate strategy directly without retrieval
             strategy_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_STRATEGY_NO_RETRIEVAL
             strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
+            timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_time))
             strategy = extract_strategy_from_response(strategy_response)
             
             if not strategy_response:
@@ -876,6 +910,7 @@ class Agent:
                 strategy=strategy if strategy else "[No strategy provided]"
             )
             final_response, action_time = await self.get_action_from_gpt(action_prompt)
+            timing_calls.append(_timing_call("final_action", "action", action_time))
             final_action = extract_action_from_response(final_response)
             
             # Debug: Check if final_response is empty
@@ -890,11 +925,7 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
-                "timing_info": {
-                    "retrieval_time": 0.0,
-                    "strategy_time": strategy_time,
-                    "action_time": action_time,
-                },
+                "timing_info": _summarize_timing_calls(timing_calls),
             }
             
             return final_response, False, "no_retrieval", retrieval_info
@@ -902,6 +933,7 @@ class Agent:
             logging.warning(f"Three-stage no retrieval failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
             direct_response, direct_time = await self.get_action_from_gpt(prompt)
+            timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
                 "strategy_prompt": None,
@@ -910,11 +942,7 @@ class Agent:
                 "action_prompt": None,
                 "final_response": direct_response,
                 "final_action": direct_action,
-                "timing_info": {
-                    "retrieval_time": 0.0,
-                    "strategy_time": 0.0,
-                    "action_time": direct_time,
-                },
+                "timing_info": _summarize_timing_calls(timing_calls),
             }
             return direct_response, False, "", retrieval_info
     
@@ -938,6 +966,7 @@ class Agent:
             (final_action, retrieval_requested, retrieval_reason, retrieval_info)
             retrieval_info contains detailed info from retrieval and action generation
         """
+        timing_calls = []
         try:
             # Import here to avoid circular dependency
             from utils import get_top_k_memories
@@ -946,6 +975,7 @@ class Agent:
             retrieval_start = time.time()
             top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
             retrieval_time = time.time() - retrieval_start
+            timing_calls.append(_timing_call("memory_retrieval", "retrieval", retrieval_time))
             retrieved_exp = "\n\n".join([
                 f"Retrieved Item {idx}:\n{content}" 
                 for idx, (content, relevance_score) in enumerate(top_k_memories)
@@ -956,6 +986,7 @@ class Agent:
                 retrieved_exp=retrieved_exp
             )
             final_response, action_time = await self.get_action_from_gpt(action_prompt)
+            timing_calls.append(_timing_call("retrieval_guided_action", "action", action_time))
             final_action = extract_action_from_response(final_response)
             
             # Debug: Check if final_response is empty
@@ -967,11 +998,7 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
-                "timing_info": {
-                    "retrieval_time": retrieval_time,
-                    "strategy_time": 0.0,
-                    "action_time": action_time,
-                },
+                "timing_info": _summarize_timing_calls(timing_calls),
             }
             
             return final_response, True, "always_retrieve", retrieval_info
@@ -979,17 +1006,14 @@ class Agent:
             logging.warning(f"Direct retrieval every step failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
             direct_response, direct_time = await self.get_action_from_gpt(prompt)
+            timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
                 "action_prompt": None,
                 "final_response": direct_response,
                 "final_action": direct_action,
             }
-            retrieval_info["timing_info"] = {
-                "retrieval_time": 0.0,
-                "strategy_time": 0.0,
-                "action_time": direct_time,
-            }
+            retrieval_info["timing_info"] = _summarize_timing_calls(timing_calls)
             return direct_response, False, "", retrieval_info
     
     async def get_action_with_adamem_low(
@@ -1014,8 +1038,10 @@ class Agent:
         Returns:
             (final_action, retrieval_requested, retrieval_reason, retrieval_info, timing_info)
             retrieval_info contains detailed info from stages
-            timing_info contains {retrieval_time, strategy_time, action_time}
+            timing_info includes the actual call list, additive per-instance
+            times, and concurrent batch wall-clock time.
         """
+        timing_calls = []
         try:
             current_strategy = self.active_strategies.get(env_idx, None)
             
@@ -1030,6 +1056,7 @@ class Agent:
                 else:
                     top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
                 retrieval_time = time.time() - retrieval_start
+                timing_calls.append(_timing_call("memory_retrieval", "retrieval", retrieval_time))
                 
                 retrieved_exp = "\n\n".join([
                     f"Retrieved Item {idx}:\n{content}" 
@@ -1046,6 +1073,7 @@ class Agent:
                     retrieved_exp=retrieved_exp
                 )
                 strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(strategy_prompt)
+                timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_gen_time))
                 new_strategy = extract_strategy_from_response(strategy_response)
                 
                 strategy_time = strategy_gen_time
@@ -1062,6 +1090,7 @@ class Agent:
                     strategy=new_strategy
                 )
                 final_response, action_time = await self.get_action_from_gpt(action_prompt)
+                timing_calls.append(_timing_call("strategy_guided_action", "action", action_time))
                 final_action = extract_action_from_response(final_response)
                 
                 if not final_response:
@@ -1084,11 +1113,7 @@ class Agent:
                     "final_action": final_action,
                 }
                 
-                timing_info = {
-                    "retrieval_time": retrieval_time,
-                    "strategy_time": strategy_time,
-                    "action_time": action_time
-                }
+                timing_info = _summarize_timing_calls(timing_calls)
                 
                 return final_response, True, "initial_strategy_generation", retrieval_info, timing_info
             else:
@@ -1099,6 +1124,13 @@ class Agent:
                 combined_response, combined_time = await self.get_action_from_gpt(combined_prompt)
                 
                 initial_action_from_combined, should_refresh, refresh_reason = parse_action_and_refresh(combined_response)
+                timing_calls.append(
+                    _timing_call(
+                        "action_and_refresh_decision",
+                        "strategy" if should_refresh else "action",
+                        combined_time,
+                    )
+                )
                 
                 if not should_refresh:
                     # The combined response is both the refresh decision and the
@@ -1119,11 +1151,7 @@ class Agent:
                         "final_action": initial_action_from_combined,
                     }
                     
-                    timing_info = {
-                        "retrieval_time": 0.0,
-                        "strategy_time": 0.0,
-                        "action_time": combined_time
-                    }
+                    timing_info = _summarize_timing_calls(timing_calls)
                     
                     return combined_response, False, "strategy_reused", retrieval_info, timing_info
                 else:
@@ -1137,6 +1165,7 @@ class Agent:
                     else:
                         top_k_memories = get_top_k_memories(current_obs_text, topk=topk)
                     retrieval_time = time.time() - retrieval_start
+                    timing_calls.append(_timing_call("memory_retrieval", "retrieval", retrieval_time))
                     
                     retrieved_exp = "\n\n".join([
                         f"Retrieved Item {idx}:\n{content}" 
@@ -1153,6 +1182,7 @@ class Agent:
                         retrieved_exp=retrieved_exp
                     )
                     strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(strategy_prompt)
+                    timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_gen_time))
                     new_strategy = extract_strategy_from_response(strategy_response)
                     
                     # The combined call produced the tentative action and the
@@ -1171,6 +1201,7 @@ class Agent:
                         strategy=new_strategy
                     )
                     final_response, action_time = await self.get_action_from_gpt(action_prompt)
+                    timing_calls.append(_timing_call("strategy_guided_action", "action", action_time))
                     final_action = extract_action_from_response(final_response)
                     
                     if not final_response:
@@ -1193,17 +1224,14 @@ class Agent:
                         "final_action": final_action,
                     }
                     
-                    timing_info = {
-                        "retrieval_time": retrieval_time,
-                        "strategy_time": strategy_time,
-                        "action_time": action_time
-                    }
+                    timing_info = _summarize_timing_calls(timing_calls)
                     
                     return final_response, True, "strategy_refreshed", retrieval_info, timing_info
         except Exception as e:
             logging.warning(f"Step strategy reuse failed for env {env_idx}: {e}. Using direct action.")
             direct_prompt = prompt + "\n\n" + ALFWORLD_ACTION_INSTR
             direct_response, direct_time = await self.get_action_from_gpt(direct_prompt)
+            timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             initial_action = extract_action_from_response(direct_response)
             retrieval_info = {
                 "direct_prompt": direct_prompt,
@@ -1211,11 +1239,7 @@ class Agent:
                 "initial_action": initial_action,
                 "error": str(e)
             }
-            timing_info = {
-                "retrieval_time": 0.0,
-                "strategy_time": 0.0,
-                "action_time": direct_time
-            }
+            timing_info = _summarize_timing_calls(timing_calls)
             return direct_response, False, "", retrieval_info, timing_info
 
 async def main():
@@ -1415,14 +1439,13 @@ async def main():
                 retrieval_infos = [None] * current_batch_size
     
                 # Track timing for each environment
-                step_timings = [{
-                    "retrieval_time": 0.0,
-                    "strategy_time": 0.0,
-                    "action_time": 0.0
-                } for _ in range(current_batch_size)]
+                step_timings = [
+                    _summarize_timing_calls([]) for _ in range(current_batch_size)
+                ]
     
                 active_indices = [i for i in range(current_batch_size) if not env_dones[i]]
                 if active_indices:
+                    action_batch_start = time.perf_counter()
                     prompts = [obs["text"][i] for i in active_indices]
                     
                     # Async gather all action generations (with optional memory)
@@ -1657,7 +1680,9 @@ async def main():
                             for active_env_idx, (action, action_time) in enumerate(results):
                                 idx = active_indices[active_env_idx]
                                 actions[idx] = action
-                                step_timings[idx]["action_time"] = action_time
+                                step_timings[idx] = _summarize_timing_calls([
+                                    _timing_call("prompt_action", "action", action_time)
+                                ])
                                 # Retrieval is embedded in prompt, so we don't have separate timing
                                 # For these methods, retrieval happens in env_manager.build_text_obs
                         else:
@@ -1667,7 +1692,15 @@ async def main():
                             for active_env_idx, (action, action_time) in enumerate(results):
                                 idx = active_indices[active_env_idx]
                                 actions[idx] = action
-                                step_timings[idx]["action_time"] = action_time
+                                step_timings[idx] = _summarize_timing_calls([
+                                    _timing_call("direct_action", "action", action_time)
+                                ])
+
+                    action_batch_wall_time = time.perf_counter() - action_batch_start
+                    for idx in active_indices:
+                        step_timings[idx] = _set_wall_clock_time(
+                            step_timings[idx], action_batch_wall_time
+                        )
     
                 for i in range(current_batch_size):
                     if env_dones[i]:
@@ -1733,8 +1766,10 @@ async def main():
                     
                     batch_trajs[i]["steps"].append(step_item)
     
-                    # Add timing information for this step
-                    batch_trajs[i]["timing_per_step"].append(step_timings[i])
+                    # Completed environments receive placeholder step records,
+                    # but they must not inflate the measured step count.
+                    if i in active_indices:
+                        batch_trajs[i]["timing_per_step"].append(step_timings[i])
     
                 # --- Environment stepping ---
                 obs, rewards, dones, infos = env_manager.step(actions)
@@ -1936,12 +1971,25 @@ async def main():
             instance_retrieval_time = 0.0
             instance_strategy_time = 0.0
             instance_action_time = 0.0
+            instance_model_time = 0.0
+            instance_wall_clock_time = 0.0
+            instance_calls = []
             instance_steps = len(traj["timing_per_step"])
             
-            for step_timing in traj["timing_per_step"]:
+            for step_idx, step_timing in enumerate(traj["timing_per_step"]):
                 instance_retrieval_time += step_timing.get("retrieval_time", 0.0)
                 instance_strategy_time += step_timing.get("strategy_time", 0.0)
                 instance_action_time += step_timing.get("action_time", 0.0)
+                instance_model_time += step_timing.get(
+                    "model_time",
+                    step_timing.get("strategy_time", 0.0)
+                    + step_timing.get("action_time", 0.0),
+                )
+                instance_wall_clock_time += step_timing.get("wall_clock_time", 0.0)
+                instance_calls.extend(
+                    {"step_idx": step_idx, **call}
+                    for call in step_timing.get("calls", [])
+                )
             
             instance_total_time = instance_retrieval_time + instance_strategy_time + instance_action_time
             
@@ -1950,6 +1998,9 @@ async def main():
                 "retrieval": instance_retrieval_time,
                 "strategy": instance_strategy_time,
                 "action": instance_action_time,
+                "model_time": instance_model_time,
+                "wall_clock_time": instance_wall_clock_time,
+                "calls": instance_calls,
                 "steps": instance_steps,
                 "round_idx": traj.get("round_idx", 0)
             })
@@ -1974,6 +2025,8 @@ async def main():
                 "retrieval": np.mean([inst["retrieval"] for inst in round_instances]),
                 "strategy": np.mean([inst["strategy"] for inst in round_instances]),
                 "action": np.mean([inst["action"] for inst in round_instances]),
+                "model_time": np.mean([inst["model_time"] for inst in round_instances]),
+                "wall_clock_time": np.mean([inst["wall_clock_time"] for inst in round_instances]),
                 "steps": np.mean([inst["steps"] for inst in round_instances]),
                 "num_instances": len(round_instances)
             }
@@ -1985,23 +2038,33 @@ async def main():
         retrieval_times = [inst["retrieval"] for inst in timing_stats["per_instance"]]
         strategy_times = [inst["strategy"] for inst in timing_stats["per_instance"]]
         action_times = [inst["action"] for inst in timing_stats["per_instance"]]
+        model_times = [inst["model_time"] for inst in timing_stats["per_instance"]]
+        wall_clock_times = [inst["wall_clock_time"] for inst in timing_stats["per_instance"]]
         
         # Overall statistics (all instances)
         logging.info(f"Total instances: {len(timing_stats['per_instance'])}")
         logging.info(
-            f"Average total time per instance (all): {np.mean(total_times):.2f}s ± {np.std(total_times, ddof=1):.2f}s"
+            f"Average total time per instance (all): {np.mean(total_times):.2f}s ± {_sample_std(total_times):.2f}s"
         )
         logging.info(
-            f"Average retrieval time per instance (all): {np.mean(retrieval_times):.2f}s ± {np.std(retrieval_times, ddof=1):.2f}s "
+            f"Average retrieval time per instance (all): {np.mean(retrieval_times):.2f}s ± {_sample_std(retrieval_times):.2f}s "
             f"({np.mean(retrieval_times) / max(np.mean(total_times), 0.001) * 100:.1f}% of total)"
         )
         logging.info(
-            f"Average strategy time per instance (all): {np.mean(strategy_times):.2f}s ± {np.std(strategy_times, ddof=1):.2f}s "
+            f"Average strategy time per instance (all): {np.mean(strategy_times):.2f}s ± {_sample_std(strategy_times):.2f}s "
             f"({np.mean(strategy_times) / max(np.mean(total_times), 0.001) * 100:.1f}% of total)"
         )
         logging.info(
-            f"Average action time per instance (all): {np.mean(action_times):.2f}s ± {np.std(action_times, ddof=1):.2f}s "
+            f"Average action time per instance (all): {np.mean(action_times):.2f}s ± {_sample_std(action_times):.2f}s "
             f"({np.mean(action_times) / max(np.mean(total_times), 0.001) * 100:.1f}% of total)"
+        )
+        logging.info(
+            f"Average model time per instance (sum of calls): {np.mean(model_times):.2f}s ± "
+            f"{_sample_std(model_times):.2f}s"
+        )
+        logging.info(
+            f"Average concurrent wall-clock time per instance: {np.mean(wall_clock_times):.2f}s ± "
+            f"{_sample_std(wall_clock_times):.2f}s"
         )
         
         # Per-round statistics (average of round averages)
@@ -2047,7 +2110,11 @@ async def main():
         # Per-step timing
         avg_steps = np.mean(timing_stats["per_instance_step_count"])
         logging.info(
-            f"\nAverage time per step: {np.mean(total_times) / max(avg_steps, 1):.3f}s"
+            f"\nAverage summed call time per step: {np.mean(total_times) / max(avg_steps, 1):.3f}s"
+        )
+        logging.info(
+            f"Average concurrent wall-clock time per step: "
+            f"{np.mean(wall_clock_times) / max(avg_steps, 1):.3f}s"
         )
         
         # Save detailed timing stats to a separate JSON file
