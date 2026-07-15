@@ -19,6 +19,7 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 from datetime import datetime
 from collections import defaultdict
 from agent_system.environments.env_manager import *
+from agent_system.token_accounting import summarize_token_calls, token_call_from_response
 from openai import AsyncOpenAI, APIError, RateLimitError, APIConnectionError
 
 try:
@@ -123,6 +124,14 @@ def _set_wall_clock_time(timing_info: dict, wall_clock_time: float) -> dict:
     """Attach concurrent wall-clock latency without changing additive call time."""
     timing_info = dict(timing_info)
     timing_info["wall_clock_time"] = max(float(wall_clock_time), 0.0)
+    return timing_info
+
+
+def _attach_token_usage(timing_info: dict, token_calls) -> dict:
+    """Attach exact API-layer usage records to one environment step."""
+    timing_info = dict(timing_info)
+    timing_info["token_calls"] = [dict(call) for call in token_calls]
+    timing_info["token_usage"] = summarize_token_calls(token_calls)
     return timing_info
 
 
@@ -374,7 +383,11 @@ class Agent:
         # Cost tracking for API usage
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        self.billable_input_tokens = 0
+        self.billable_output_tokens = 0
         self.total_cost = 0.0
+        self.token_usage_calls = []
+        self._missing_usage_warnings = set()
         self.input_token_cost_per_million = 0.05  # $0.05 per 1M input tokens
         self.output_token_cost_per_million = 0.40  # $0.40 per 1M output tokens
 
@@ -501,23 +514,68 @@ class Agent:
         self._record_truncation(retrieval_text, truncated)
         return truncated
 
-    def track_api_cost(self, response):
-        """Track API costs based on token usage in the response."""
-        if hasattr(response, 'usage') and response.usage:
-            input_tokens = getattr(response.usage, 'prompt_tokens', 0)
-            output_tokens = getattr(response.usage, 'completion_tokens', 0)
+    def track_api_cost(
+        self,
+        response,
+        *,
+        call_type="unknown",
+        model=None,
+        backend=None,
+        token_calls=None,
+    ):
+        """Record server-reported tokens at the API boundary for every backend."""
+        record = token_call_from_response(
+            response,
+            call_type=call_type,
+            model=model or self.model_name,
+            backend=backend or self.backend,
+        )
+        self.token_usage_calls.append(record)
+        if token_calls is not None:
+            token_calls.append(record)
+
+        if record["usage_available"]:
+            input_tokens = record["input_tokens"]
+            output_tokens = record["output_tokens"]
             
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
-            
-            # Calculate cost in dollars
-            input_cost = (input_tokens / 1_000_000) * self.input_token_cost_per_million
-            output_cost = (output_tokens / 1_000_000) * self.output_token_cost_per_million
-            cost = input_cost + output_cost
-            
-            self.total_cost += cost
-            
-            logging.info(f"API call: {input_tokens} input tokens (${input_cost:.6f}), {output_tokens} output tokens (${output_cost:.6f}), total cost: ${cost:.6f}")
+
+            if record["backend"] in {"openai", "openai-compatible"}:
+                self.billable_input_tokens += input_tokens
+                self.billable_output_tokens += output_tokens
+                input_cost = (input_tokens / 1_000_000) * self.input_token_cost_per_million
+                output_cost = (output_tokens / 1_000_000) * self.output_token_cost_per_million
+                cost = input_cost + output_cost
+                self.total_cost += cost
+                logging.info(
+                    "API call %s: %s input tokens ($%.6f), %s output tokens "
+                    "($%.6f), total cost: $%.6f",
+                    call_type,
+                    input_tokens,
+                    input_cost,
+                    output_tokens,
+                    output_cost,
+                    cost,
+                )
+            else:
+                logging.info(
+                    "Local model call %s: %s input tokens, %s output tokens",
+                    call_type,
+                    input_tokens,
+                    output_tokens,
+                )
+        else:
+            warning_key = (record["model"], record["backend"])
+            if warning_key not in self._missing_usage_warnings:
+                self._missing_usage_warnings.add(warning_key)
+                logging.warning(
+                    "Token usage unavailable from %s (%s); affected calls "
+                    "will be marked usage_available=false instead of estimated.",
+                    record["model"],
+                    record["backend"],
+                )
+        return record
 
     def get_cost_summary(self):
         """Get a summary of total API costs."""
@@ -526,8 +584,15 @@ class Agent:
             'total_output_tokens': self.total_output_tokens,
             'total_tokens': self.total_input_tokens + self.total_output_tokens,
             'total_cost': self.total_cost,
-            'input_cost': (self.total_input_tokens / 1_000_000) * self.input_token_cost_per_million,
-            'output_cost': (self.total_output_tokens / 1_000_000) * self.output_token_cost_per_million
+            'input_cost': (self.billable_input_tokens / 1_000_000) * self.input_token_cost_per_million,
+            'output_cost': (self.billable_output_tokens / 1_000_000) * self.output_token_cost_per_million,
+            'billable_input_tokens': self.billable_input_tokens,
+            'billable_output_tokens': self.billable_output_tokens,
+            'calls': len(self.token_usage_calls),
+            'missing_usage_calls': sum(
+                not call["usage_available"] for call in self.token_usage_calls
+            ),
+            'by_call_type': summarize_token_calls(self.token_usage_calls)["by_call_type"],
         }
 
     async def _retry_api_call(self, api_call_func, max_retries=3, base_delay=1.0):
@@ -566,7 +631,7 @@ class Agent:
         # If we get here, all retries failed
         raise last_exception
 
-    async def get_action_from_gpt(self, obs):
+    async def get_action_from_gpt(self, obs, *, call_type="action", token_calls=None):
         start_time = time.time()
         if self.backend == "openai":
             async def _api_call():
@@ -576,7 +641,13 @@ class Agent:
                         messages=[{"role": "user", "content": obs}],
                         max_completion_tokens=self.max_tokens,
                     )
-                self.track_api_cost(resp)
+                self.track_api_cost(
+                    resp,
+                    call_type=call_type,
+                    model=self.model_name,
+                    backend=self.backend,
+                    token_calls=token_calls,
+                )
                 ret = resp.choices[0].message.content.strip()
                 if not ret:
                     raise RuntimeError(f"Empty response from OpenAI for prompt: {obs}")
@@ -603,14 +674,20 @@ class Agent:
                         f"vLLM action completion on {ip_addr}",
                     )
                 ) from e
-            # Note: vLLM may not provide usage info, so we skip cost tracking for vLLM
+            self.track_api_cost(
+                resp,
+                call_type=call_type,
+                model=self.model_name,
+                backend=self.backend,
+                token_calls=token_calls,
+            )
             ret = resp.choices[0].message.content.strip()
             if not ret:
                 raise RuntimeError(f"Empty response {resp} from {ip_addr} for prompt: {obs}")
             elapsed = time.time() - start_time
             return ret, elapsed
     
-    async def get_strategy_from_gpt(self, obs):
+    async def get_strategy_from_gpt(self, obs, *, call_type="strategy_synthesis", token_calls=None):
         start_time = time.time()
         if self.strategy_backend in {"openai", "openai-compatible"}:
             async def _api_call():
@@ -628,7 +705,13 @@ class Agent:
                     resp = await self.strategy_client.chat.completions.create(
                         **request_kwargs
                     )
-                self.track_api_cost(resp)
+                self.track_api_cost(
+                    resp,
+                    call_type=call_type,
+                    model=self.strategy_model_name,
+                    backend=self.strategy_backend,
+                    token_calls=token_calls,
+                )
                 ret = resp.choices[0].message.content.strip()
                 if not ret:
                     raise RuntimeError(
@@ -657,7 +740,13 @@ class Agent:
                         f"vLLM strategy completion on {ip_addr}",
                     )
                 ) from e
-            # Note: vLLM may not provide usage info, so we skip cost tracking for vLLM
+            self.track_api_cost(
+                resp,
+                call_type=call_type,
+                model=self.strategy_model_name,
+                backend=self.strategy_backend,
+                token_calls=token_calls,
+            )
             ret = resp.choices[0].message.content.strip()
             if not ret:
                 raise RuntimeError(f"Empty response {resp} from strategy server {ip_addr} for prompt: {obs}")
@@ -685,8 +774,13 @@ class Agent:
             retrieval_info contains detailed info from all stages
         """
         # Stage 1: Get initial response
+        token_calls = []
         initial_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_WITH_OPTIONAL_MEMORY
-        initial_response, initial_action_time = await self.get_action_from_gpt(initial_prompt)
+        initial_response, initial_action_time = await self.get_action_from_gpt(
+            initial_prompt,
+            call_type="initial_action_and_memory_decision",
+            token_calls=token_calls,
+        )
         timing_calls = [_timing_call("initial_action", "action", initial_action_time)]
 
         # Extract initial action
@@ -715,7 +809,11 @@ class Agent:
                     k=topk,
                     retrieved_exp=retrieved_exp
                 )
-                strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
+                strategy_response, strategy_time = await self.get_strategy_from_gpt(
+                    strategy_prompt,
+                    call_type="strategy_synthesis",
+                    token_calls=token_calls,
+                )
                 timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_time))
                 strategy = extract_strategy_from_response(strategy_response)
                 
@@ -726,7 +824,11 @@ class Agent:
                 action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                     strategy=strategy if strategy else "[No strategy provided]"
                 )
-                final_response, final_action_time = await self.get_action_from_gpt(action_prompt)
+                final_response, final_action_time = await self.get_action_from_gpt(
+                    action_prompt,
+                    call_type="strategy_guided_action",
+                    token_calls=token_calls,
+                )
                 timing_calls.append(_timing_call("final_action", "action", final_action_time))
                 final_action = extract_action_from_response(final_response)
                 
@@ -749,7 +851,9 @@ class Agent:
                     "final_response": final_response,
                     "final_action": final_action,
                     "action_changed": action_changed,
-                    "timing_info": _summarize_timing_calls(timing_calls),
+                    "timing_info": _attach_token_usage(
+                        _summarize_timing_calls(timing_calls), token_calls
+                    ),
                 }
                 
                 return final_response, True, reason, retrieval_info
@@ -766,7 +870,9 @@ class Agent:
                     "final_response": None,
                     "final_action": initial_action,
                     "action_changed": False,
-                    "timing_info": _summarize_timing_calls(timing_calls),
+                    "timing_info": _attach_token_usage(
+                        _summarize_timing_calls(timing_calls), token_calls
+                    ),
                 }
                 return initial_response, False, "", retrieval_info
         else:
@@ -782,7 +888,9 @@ class Agent:
                 "final_response": None,
                 "final_action": initial_action,
                 "action_changed": False,
-                "timing_info": _summarize_timing_calls(timing_calls),
+                "timing_info": _attach_token_usage(
+                    _summarize_timing_calls(timing_calls), token_calls
+                ),
             }
             return initial_response, False, "", retrieval_info
     
@@ -807,6 +915,7 @@ class Agent:
             retrieval_info contains detailed info from all stages
         """
         timing_calls = []
+        token_calls = []
         try:
             # Import here to avoid circular dependency
             from utils import get_top_k_memories
@@ -826,7 +935,11 @@ class Agent:
                 k=topk,
                 retrieved_exp=retrieved_exp
             )
-            strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
+            strategy_response, strategy_time = await self.get_strategy_from_gpt(
+                strategy_prompt,
+                call_type="strategy_synthesis",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_time))
             strategy = extract_strategy_from_response(strategy_response)
             
@@ -837,7 +950,11 @@ class Agent:
             action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                 strategy=strategy if strategy else "[No strategy provided]"
             )
-            final_response, action_time = await self.get_action_from_gpt(action_prompt)
+            final_response, action_time = await self.get_action_from_gpt(
+                action_prompt,
+                call_type="strategy_guided_action",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("final_action", "action", action_time))
             final_action = extract_action_from_response(final_response)
             
@@ -853,14 +970,20 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
-                "timing_info": _summarize_timing_calls(timing_calls),
+                "timing_info": _attach_token_usage(
+                    _summarize_timing_calls(timing_calls), token_calls
+                ),
             }
             
             return final_response, True, "always_retrieve", retrieval_info
         except Exception as e:
             logging.warning(f"Three-stage every step memory retrieval failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
-            direct_response, direct_time = await self.get_action_from_gpt(prompt)
+            direct_response, direct_time = await self.get_action_from_gpt(
+                prompt,
+                call_type="fallback_action",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
@@ -870,7 +993,9 @@ class Agent:
                 "action_prompt": None,
                 "final_response": direct_response,
                 "final_action": direct_action,
-                "timing_info": _summarize_timing_calls(timing_calls),
+                "timing_info": _attach_token_usage(
+                    _summarize_timing_calls(timing_calls), token_calls
+                ),
             }
             return direct_response, False, "", retrieval_info
     
@@ -895,10 +1020,15 @@ class Agent:
             retrieval_info contains detailed info from stages
         """
         timing_calls = []
+        token_calls = []
         try:
             # Stage 1: Generate strategy directly without retrieval
             strategy_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_STRATEGY_NO_RETRIEVAL
-            strategy_response, strategy_time = await self.get_strategy_from_gpt(strategy_prompt)
+            strategy_response, strategy_time = await self.get_strategy_from_gpt(
+                strategy_prompt,
+                call_type="strategy_synthesis",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_time))
             strategy = extract_strategy_from_response(strategy_response)
             
@@ -909,7 +1039,11 @@ class Agent:
             action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                 strategy=strategy if strategy else "[No strategy provided]"
             )
-            final_response, action_time = await self.get_action_from_gpt(action_prompt)
+            final_response, action_time = await self.get_action_from_gpt(
+                action_prompt,
+                call_type="strategy_guided_action",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("final_action", "action", action_time))
             final_action = extract_action_from_response(final_response)
             
@@ -925,14 +1059,20 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
-                "timing_info": _summarize_timing_calls(timing_calls),
+                "timing_info": _attach_token_usage(
+                    _summarize_timing_calls(timing_calls), token_calls
+                ),
             }
             
             return final_response, False, "no_retrieval", retrieval_info
         except Exception as e:
             logging.warning(f"Three-stage no retrieval failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
-            direct_response, direct_time = await self.get_action_from_gpt(prompt)
+            direct_response, direct_time = await self.get_action_from_gpt(
+                prompt,
+                call_type="fallback_action",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
@@ -942,7 +1082,9 @@ class Agent:
                 "action_prompt": None,
                 "final_response": direct_response,
                 "final_action": direct_action,
-                "timing_info": _summarize_timing_calls(timing_calls),
+                "timing_info": _attach_token_usage(
+                    _summarize_timing_calls(timing_calls), token_calls
+                ),
             }
             return direct_response, False, "", retrieval_info
     
@@ -967,6 +1109,7 @@ class Agent:
             retrieval_info contains detailed info from retrieval and action generation
         """
         timing_calls = []
+        token_calls = []
         try:
             # Import here to avoid circular dependency
             from utils import get_top_k_memories
@@ -985,7 +1128,11 @@ class Agent:
             action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_DIRECT_ACTION_FROM_RETRIEVAL.format(
                 retrieved_exp=retrieved_exp
             )
-            final_response, action_time = await self.get_action_from_gpt(action_prompt)
+            final_response, action_time = await self.get_action_from_gpt(
+                action_prompt,
+                call_type="retrieval_guided_action",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("retrieval_guided_action", "action", action_time))
             final_action = extract_action_from_response(final_response)
             
@@ -998,14 +1145,20 @@ class Agent:
                 "action_prompt": action_prompt,
                 "final_response": final_response,
                 "final_action": final_action,
-                "timing_info": _summarize_timing_calls(timing_calls),
+                "timing_info": _attach_token_usage(
+                    _summarize_timing_calls(timing_calls), token_calls
+                ),
             }
             
             return final_response, True, "always_retrieve", retrieval_info
         except Exception as e:
             logging.warning(f"Direct retrieval every step failed for env {env_idx}: {e}. Using direct action.")
             # Fallback to direct action
-            direct_response, direct_time = await self.get_action_from_gpt(prompt)
+            direct_response, direct_time = await self.get_action_from_gpt(
+                prompt,
+                call_type="fallback_action",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             direct_action = extract_action_from_response(direct_response)
             retrieval_info = {
@@ -1013,7 +1166,9 @@ class Agent:
                 "final_response": direct_response,
                 "final_action": direct_action,
             }
-            retrieval_info["timing_info"] = _summarize_timing_calls(timing_calls)
+            retrieval_info["timing_info"] = _attach_token_usage(
+                _summarize_timing_calls(timing_calls), token_calls
+            )
             return direct_response, False, "", retrieval_info
     
     async def get_action_with_adamem_low(
@@ -1042,6 +1197,7 @@ class Agent:
             times, and concurrent batch wall-clock time.
         """
         timing_calls = []
+        token_calls = []
         try:
             current_strategy = self.active_strategies.get(env_idx, None)
             
@@ -1072,7 +1228,11 @@ class Agent:
                     k=topk,
                     retrieved_exp=retrieved_exp
                 )
-                strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(strategy_prompt)
+                strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(
+                    strategy_prompt,
+                    call_type="strategy_synthesis",
+                    token_calls=token_calls,
+                )
                 timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_gen_time))
                 new_strategy = extract_strategy_from_response(strategy_response)
                 
@@ -1089,7 +1249,11 @@ class Agent:
                 action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                     strategy=new_strategy
                 )
-                final_response, action_time = await self.get_action_from_gpt(action_prompt)
+                final_response, action_time = await self.get_action_from_gpt(
+                    action_prompt,
+                    call_type="strategy_guided_action",
+                    token_calls=token_calls,
+                )
                 timing_calls.append(_timing_call("strategy_guided_action", "action", action_time))
                 final_action = extract_action_from_response(final_response)
                 
@@ -1113,7 +1277,9 @@ class Agent:
                     "final_action": final_action,
                 }
                 
-                timing_info = _summarize_timing_calls(timing_calls)
+                timing_info = _attach_token_usage(
+                    _summarize_timing_calls(timing_calls), token_calls
+                )
                 
                 return final_response, True, "initial_strategy_generation", retrieval_info, timing_info
             else:
@@ -1121,7 +1287,11 @@ class Agent:
                 combined_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_STRATEGY_REFRESH_DECISION.format(
                     current_strategy=current_strategy
                 )
-                combined_response, combined_time = await self.get_action_from_gpt(combined_prompt)
+                combined_response, combined_time = await self.get_action_from_gpt(
+                    combined_prompt,
+                    call_type="action_and_refresh_decision",
+                    token_calls=token_calls,
+                )
                 
                 initial_action_from_combined, should_refresh, refresh_reason = parse_action_and_refresh(combined_response)
                 timing_calls.append(
@@ -1151,7 +1321,9 @@ class Agent:
                         "final_action": initial_action_from_combined,
                     }
                     
-                    timing_info = _summarize_timing_calls(timing_calls)
+                    timing_info = _attach_token_usage(
+                        _summarize_timing_calls(timing_calls), token_calls
+                    )
                     
                     return combined_response, False, "strategy_reused", retrieval_info, timing_info
                 else:
@@ -1181,7 +1353,11 @@ class Agent:
                         k=topk,
                         retrieved_exp=retrieved_exp
                     )
-                    strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(strategy_prompt)
+                    strategy_response, strategy_gen_time = await self.get_strategy_from_gpt(
+                        strategy_prompt,
+                        call_type="strategy_synthesis",
+                        token_calls=token_calls,
+                    )
                     timing_calls.append(_timing_call("strategy_synthesis", "strategy", strategy_gen_time))
                     new_strategy = extract_strategy_from_response(strategy_response)
                     
@@ -1200,7 +1376,11 @@ class Agent:
                     action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
                         strategy=new_strategy
                     )
-                    final_response, action_time = await self.get_action_from_gpt(action_prompt)
+                    final_response, action_time = await self.get_action_from_gpt(
+                        action_prompt,
+                        call_type="strategy_guided_action",
+                        token_calls=token_calls,
+                    )
                     timing_calls.append(_timing_call("strategy_guided_action", "action", action_time))
                     final_action = extract_action_from_response(final_response)
                     
@@ -1224,13 +1404,19 @@ class Agent:
                         "final_action": final_action,
                     }
                     
-                    timing_info = _summarize_timing_calls(timing_calls)
+                    timing_info = _attach_token_usage(
+                        _summarize_timing_calls(timing_calls), token_calls
+                    )
                     
                     return final_response, True, "strategy_refreshed", retrieval_info, timing_info
         except Exception as e:
             logging.warning(f"Step strategy reuse failed for env {env_idx}: {e}. Using direct action.")
             direct_prompt = prompt + "\n\n" + ALFWORLD_ACTION_INSTR
-            direct_response, direct_time = await self.get_action_from_gpt(direct_prompt)
+            direct_response, direct_time = await self.get_action_from_gpt(
+                direct_prompt,
+                call_type="fallback_action",
+                token_calls=token_calls,
+            )
             timing_calls.append(_timing_call("fallback_action", "action", direct_time))
             initial_action = extract_action_from_response(direct_response)
             retrieval_info = {
@@ -1239,7 +1425,9 @@ class Agent:
                 "initial_action": initial_action,
                 "error": str(e)
             }
-            timing_info = _summarize_timing_calls(timing_calls)
+            timing_info = _attach_token_usage(
+                _summarize_timing_calls(timing_calls), token_calls
+            )
             return direct_response, False, "", retrieval_info, timing_info
 
 async def main():
@@ -1440,8 +1628,10 @@ async def main():
     
                 # Track timing for each environment
                 step_timings = [
-                    _summarize_timing_calls([]) for _ in range(current_batch_size)
+                    _attach_token_usage(_summarize_timing_calls([]), [])
+                    for _ in range(current_batch_size)
                 ]
+                step_token_calls = [[] for _ in range(current_batch_size)]
     
                 active_indices = [i for i in range(current_batch_size) if not env_dones[i]]
                 if active_indices:
@@ -1675,26 +1865,46 @@ async def main():
                         if mem_type in ["reasoningbank", "synapse"]:
                             # These types have retrieval built into the prompt via env_manager
                             # The retrieval time is negligible as it's done during prompt construction
-                            tasks = [agent.get_action_from_gpt(prompt) for prompt in prompts]
+                            tasks = [
+                                agent.get_action_from_gpt(
+                                    prompt,
+                                    call_type=f"{mem_type}_prompt_action",
+                                    token_calls=step_token_calls[idx],
+                                )
+                                for prompt, idx in zip(prompts, active_indices)
+                            ]
                             results = await _batched_gather(tasks, CONCURRENT_ENV_BATCH_SIZE)
                             for active_env_idx, (action, action_time) in enumerate(results):
                                 idx = active_indices[active_env_idx]
                                 actions[idx] = action
-                                step_timings[idx] = _summarize_timing_calls([
-                                    _timing_call("prompt_action", "action", action_time)
-                                ])
+                                step_timings[idx] = _attach_token_usage(
+                                    _summarize_timing_calls([
+                                        _timing_call("prompt_action", "action", action_time)
+                                    ]),
+                                    step_token_calls[idx],
+                                )
                                 # Retrieval is embedded in prompt, so we don't have separate timing
                                 # For these methods, retrieval happens in env_manager.build_text_obs
                         else:
                             # No memory at all
-                            tasks = [agent.get_action_from_gpt(prompt) for prompt in prompts]
+                            tasks = [
+                                agent.get_action_from_gpt(
+                                    prompt,
+                                    call_type="direct_action",
+                                    token_calls=step_token_calls[idx],
+                                )
+                                for prompt, idx in zip(prompts, active_indices)
+                            ]
                             results = await _batched_gather(tasks, CONCURRENT_ENV_BATCH_SIZE)
                             for active_env_idx, (action, action_time) in enumerate(results):
                                 idx = active_indices[active_env_idx]
                                 actions[idx] = action
-                                step_timings[idx] = _summarize_timing_calls([
-                                    _timing_call("direct_action", "action", action_time)
-                                ])
+                                step_timings[idx] = _attach_token_usage(
+                                    _summarize_timing_calls([
+                                        _timing_call("direct_action", "action", action_time)
+                                    ]),
+                                    step_token_calls[idx],
+                                )
 
                     action_batch_wall_time = time.perf_counter() - action_batch_start
                     for idx in active_indices:
@@ -1859,25 +2069,35 @@ async def main():
         f"{100*np.mean(overall_success_rates):.1f} ± {100*np.std(overall_success_rates, ddof=1):.1f}"
     )
 
-    # Log API cost summary if using OpenAI backend
-    if agent.backend == "openai":
+    # Token usage is collected for both local vLLM and remote strategy APIs.
+    if agent.token_usage_calls:
         cost_summary = agent.get_cost_summary()
-        logging.info("=============== API Cost Summary ===============")
+        logging.info("=============== Token Usage Summary ===============")
         logging.info(
             f"Total input tokens: {cost_summary['total_input_tokens']:,} "
-            f"(${cost_summary['input_cost']:.4f})"
+            f"(billable API cost: ${cost_summary['input_cost']:.4f})"
         )
         logging.info(
             f"Total output tokens: {cost_summary['total_output_tokens']:,} "
-            f"(${cost_summary['output_cost']:.4f})"
+            f"(billable API cost: ${cost_summary['output_cost']:.4f})"
         )
         logging.info(
             f"Total tokens: {cost_summary['total_tokens']:,} "
             f"(Total cost: ${cost_summary['total_cost']:.4f})"
         )
         logging.info(
-            f"Average cost per test: ${cost_summary['total_cost'] / max(test_times, 1):.4f}"
+            f"Calls with missing usage: {cost_summary['missing_usage_calls']}/"
+            f"{cost_summary['calls']}"
         )
+        for call_type, usage in sorted(cost_summary["by_call_type"].items()):
+            logging.info(
+                "  %s: calls=%s, input=%s, output=%s, total=%s",
+                call_type,
+                usage["calls"],
+                usage["input_tokens"],
+                usage["output_tokens"],
+                usage["total_tokens"],
+            )
 
     # Log truncation statistics
     trunc_stats = getattr(agent, "truncation_stats", None)
@@ -1974,6 +2194,7 @@ async def main():
             instance_model_time = 0.0
             instance_wall_clock_time = 0.0
             instance_calls = []
+            instance_token_calls = []
             instance_steps = len(traj["timing_per_step"])
             
             for step_idx, step_timing in enumerate(traj["timing_per_step"]):
@@ -1990,6 +2211,10 @@ async def main():
                     {"step_idx": step_idx, **call}
                     for call in step_timing.get("calls", [])
                 )
+                instance_token_calls.extend(
+                    {"step_idx": step_idx, **call}
+                    for call in step_timing.get("token_calls", [])
+                )
             
             instance_total_time = instance_retrieval_time + instance_strategy_time + instance_action_time
             
@@ -2001,6 +2226,8 @@ async def main():
                 "model_time": instance_model_time,
                 "wall_clock_time": instance_wall_clock_time,
                 "calls": instance_calls,
+                "token_calls": instance_token_calls,
+                "token_usage": summarize_token_calls(instance_token_calls),
                 "steps": instance_steps,
                 "round_idx": traj.get("round_idx", 0)
             })
@@ -2019,6 +2246,11 @@ async def main():
         # Calculate averages for each round
         for round_idx in sorted(round_groups.keys()):
             round_instances = round_groups[round_idx]
+            round_token_calls = [
+                call
+                for instance in round_instances
+                for call in instance["token_calls"]
+            ]
             round_avg = {
                 "round_idx": round_idx,
                 "total": np.mean([inst["total"] for inst in round_instances]),
@@ -2027,10 +2259,18 @@ async def main():
                 "action": np.mean([inst["action"] for inst in round_instances]),
                 "model_time": np.mean([inst["model_time"] for inst in round_instances]),
                 "wall_clock_time": np.mean([inst["wall_clock_time"] for inst in round_instances]),
+                "token_usage": summarize_token_calls(round_token_calls),
                 "steps": np.mean([inst["steps"] for inst in round_instances]),
                 "num_instances": len(round_instances)
             }
             timing_stats["per_round"].append(round_avg)
+
+        all_token_calls = [
+            call
+            for instance in timing_stats["per_instance"]
+            for call in instance["token_calls"]
+        ]
+        timing_stats["token_usage"] = summarize_token_calls(all_token_calls)
     
     # Calculate aggregate statistics
     if timing_stats["per_instance"]:

@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from agent_system.token_accounting import summarize_token_calls
+
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
@@ -28,6 +30,7 @@ def _load_low_method(*, should_refresh):
             "_timing_call",
             "_summarize_timing_calls",
             "_set_wall_clock_time",
+            "_attach_token_usage",
         }
     ]
     method = next(
@@ -50,6 +53,7 @@ def _load_low_method(*, should_refresh):
         "mix_mode": False,
         "time": time,
         "topk": 1,
+        "summarize_token_calls": summarize_token_calls,
     }
     exec(
         compile(
@@ -177,12 +181,26 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
             strategy_calls = []
             strategy_max_tokens = 128
 
-            async def get_action_from_gpt(self, prompt):
+            async def get_action_from_gpt(self, prompt, **kwargs):
                 self.action_calls.append(prompt)
+                kwargs["token_calls"].append({
+                    "call_type": kwargs["call_type"],
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                    "usage_available": True,
+                })
                 return "action response", 0.25
 
-            async def get_strategy_from_gpt(self, prompt):
+            async def get_strategy_from_gpt(self, prompt, **kwargs):
                 self.strategy_calls.append(prompt)
+                kwargs["token_calls"].append({
+                    "call_type": kwargs["call_type"],
+                    "input_tokens": 20,
+                    "output_tokens": 4,
+                    "total_tokens": 24,
+                    "usage_available": True,
+                })
                 return "strategy response", 0.5
 
             def _truncate_retrieval_for_prompt(self, **kwargs):
@@ -200,6 +218,7 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
             [call["name"] for call in result[4]["calls"]],
             ["memory_retrieval", "strategy_synthesis", "strategy_guided_action"],
         )
+        self.assertEqual(result[4]["token_usage"]["total_tokens"], 36)
 
     async def test_reused_strategy_makes_one_action_model_call(self):
         method = _load_low_method(should_refresh=False)
@@ -208,8 +227,15 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
             active_strategies = {0: "current strategy"}
             action_calls = []
 
-            async def get_action_from_gpt(self, prompt):
+            async def get_action_from_gpt(self, prompt, **kwargs):
                 self.action_calls.append(prompt)
+                kwargs["token_calls"].append({
+                    "call_type": kwargs["call_type"],
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                    "usage_available": True,
+                })
                 return "combined response", 0.25
 
         agent = FakeAgent()
@@ -221,6 +247,7 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[3]["final_action"], "tentative action")
         self.assertEqual(result[4]["action_time"], 0.25)
         self.assertEqual(len(result[4]["calls"]), 1)
+        self.assertEqual(result[4]["token_usage"]["total_tokens"], 12)
 
     async def test_refreshed_strategy_makes_only_required_calls(self):
         method = _load_low_method(should_refresh=True)
@@ -234,12 +261,26 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
             strategy_calls = []
             strategy_max_tokens = 128
 
-            async def get_action_from_gpt(self, prompt):
+            async def get_action_from_gpt(self, prompt, **kwargs):
                 self.action_calls.append(prompt)
+                kwargs["token_calls"].append({
+                    "call_type": kwargs["call_type"],
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                    "usage_available": True,
+                })
                 return "action response", 0.25
 
-            async def get_strategy_from_gpt(self, prompt):
+            async def get_strategy_from_gpt(self, prompt, **kwargs):
                 self.strategy_calls.append(prompt)
+                kwargs["token_calls"].append({
+                    "call_type": kwargs["call_type"],
+                    "input_tokens": 20,
+                    "output_tokens": 4,
+                    "total_tokens": 24,
+                    "usage_available": True,
+                })
                 return "strategy response", 0.5
 
             def _truncate_retrieval_for_prompt(self, **kwargs):
@@ -255,6 +296,7 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[4]["strategy_time"], 0.75)
         self.assertAlmostEqual(result[4]["model_time"], 1.0)
         self.assertEqual(len(result[4]["calls"]), 4)
+        self.assertEqual(result[4]["token_usage"]["total_tokens"], 48)
 
 
 if __name__ == "__main__":
