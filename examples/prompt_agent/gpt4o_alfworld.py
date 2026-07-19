@@ -76,6 +76,21 @@ def _parse_env_float(name: str, default: float, minimum: float = 0.0) -> float:
     return value
 
 
+def _collection_batch_seed(
+    split_name: str,
+    base_seed: int,
+    round_idx: int,
+    env_num: int,
+    batch_start: int,
+) -> int:
+    """Return a reproducible, non-overlapping worker-seed base for one batch."""
+    if split_name != "train":
+        # Evaluation games are assigned deterministically by start_idx. Preserve
+        # their historical fixed seed across repeated evaluation rounds.
+        return base_seed
+    return base_seed + round_idx * env_num + batch_start
+
+
 def truncate_middle_text(text: str, max_chars: int, marker: str = "\n... [truncated] ...\n") -> str:
     if text is None:
         return ""
@@ -260,7 +275,7 @@ async def timed_retrieval(query: str, topk: int = 1):
     elapsed = time.time() - start_time
     return result, elapsed
 
-def build_env(env_name, env_num=1, start_idx=0):
+def build_env(env_name, env_num=1, start_idx=0, seed=1):
     group_n = 1
     if env_name == "alfworld":
         from agent_system.environments.env_package.alfworld import alfworld_projection
@@ -271,9 +286,9 @@ def build_env(env_name, env_num=1, start_idx=0):
         }
         resources_per_worker = {"num_cpus": 0.05, "num_gpus": 0.0}
         if split == "train":
-            envs = build_alfworld_envs(alf_config_path, seed=1, env_num=env_num, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+            envs = build_alfworld_envs(alf_config_path, seed=seed, env_num=env_num, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         else:
-            envs = build_alfworld_envs(alf_config_path, seed=1, env_num=env_num, group_n=group_n, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker, start_idx=start_idx)
+            envs = build_alfworld_envs(alf_config_path, seed=seed, env_num=env_num, group_n=group_n, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker, start_idx=start_idx)
         env_manager = AlfWorldEnvironmentManager(envs, alfworld_projection, 'alfworld/AlfredThorEnv', mem_type=mem_type, topk=topk)
     else:
         raise ValueError(f"Unsupported environment name: {env_name}")
@@ -1489,6 +1504,7 @@ async def main():
     # -------- Parameters ----------
     max_steps = int(os.environ.get("MAX_STEPS", 50))
     env_num = SPLIT2ENV_NUM[split] # 200
+    base_seed = _parse_env_int("BASE_SEED", 1, minimum=0)
     # Keep the historical defaults, but allow both training and evaluation runs
     # to be bounded explicitly.  Previously SPLIT=train always forced 1000
     # rounds and silently ignored TEST_TIMES.
@@ -1517,13 +1533,14 @@ async def main():
     num_env_batches = math.ceil(env_num / ENV_BATCH_SIZE)
     logging.info(
         "Run configuration: split=%s, rounds=%d, envs_per_round=%d, "
-        "max_task_attempts=%d, max_steps=%d, env_batch_size=%d",
+        "max_task_attempts=%d, max_steps=%d, env_batch_size=%d, base_seed=%d",
         split,
         test_times,
         env_num,
         test_times * env_num,
         max_steps,
         ENV_BATCH_SIZE,
+        base_seed,
     )
 
     def _maybe_restart_vllm_between_batches(batch_idx: int, num_batches: int) -> None:
@@ -1608,6 +1625,13 @@ async def main():
             batch_start = batch_idx * ENV_BATCH_SIZE
             batch_end = min(batch_start + ENV_BATCH_SIZE, env_num)
             current_batch_size = batch_end - batch_start
+            batch_seed = _collection_batch_seed(
+                split,
+                base_seed,
+                test_idx,
+                env_num,
+                batch_start,
+            )
 
             if num_env_batches > 1:
                 logging.info(
@@ -1619,6 +1643,7 @@ async def main():
             env_manager = build_env(
                 env_name, current_batch_size,
                 start_idx=(batch_start if split != "train" else 0),
+                seed=batch_seed,
             )
             kwargs = {}
             obs, infos = env_manager.reset(kwargs)
