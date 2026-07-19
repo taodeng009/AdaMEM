@@ -159,6 +159,24 @@ Set `MEM_TYPE` to any value from the table above. Omit `MEM_TYPE` (or set it emp
 | `TEST_TIMES` | `1000` for train, `3` for eval | Maximum collection/evaluation rounds |
 | `BASE_SEED` | `1` | Base seed for reproducible, non-overlapping training episodes |
 | `TARGET_SUCCESS_TRAJECTORIES` | `0` | Training-only unique-success target; `0` disables early stopping |
+| `RESUME_TRAJECTORY_FILE` | unset | Existing training trajectory JSON to resume in place |
+
+To continue a partially completed ALFWorld collection, pass its trajectory
+checkpoint explicitly. The success target is cumulative, while `TEST_TIMES`
+limits the number of additional rounds in this invocation:
+
+```bash
+SPLIT=train \
+MEM_TYPE= \
+RESUME_TRAJECTORY_FILE="logs/alfworld/Qwen_Qwen3-4B-Instruct-2507/traj_train_<run>.json" \
+TARGET_SUCCESS_TRAJECTORIES=200 \
+TEST_TIMES=500 \
+  python -m examples.prompt_agent.gpt4o_alfworld
+```
+
+Resumable checkpoints include `episode_id`, `round_idx`, `seed`, and
+`gamefile`. Older trajectory files without these fields are rejected because
+they cannot guarantee non-overlapping episode IDs and seeds.
 
 ### 3. STEP-MFT Training
 

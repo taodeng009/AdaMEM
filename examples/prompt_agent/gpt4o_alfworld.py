@@ -158,6 +158,83 @@ def _success_target_reached(target: int, unique_success_count: int) -> bool:
     return target > 0 and unique_success_count >= target
 
 
+def _load_trajectory_checkpoint(path: str) -> list:
+    """Load a resumable trajectory JSON file and validate its metadata."""
+    checkpoint_path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(
+            f"RESUME_TRAJECTORY_FILE does not exist: {checkpoint_path}"
+        )
+    with open(checkpoint_path, "r", encoding="utf-8") as reader:
+        trajectories = json.load(reader)
+    if not isinstance(trajectories, list):
+        raise ValueError("Resume trajectory checkpoint must contain a JSON list.")
+    required = {"episode_id", "round_idx", "seed", "gamefile", "won", "steps"}
+    for index, trajectory in enumerate(trajectories):
+        if not isinstance(trajectory, dict):
+            raise ValueError(f"Resume trajectory {index} must be a JSON object.")
+        missing = sorted(required.difference(trajectory))
+        if missing:
+            raise ValueError(
+                f"Resume trajectory {index} is missing required fields: {missing}. "
+                "Only checkpoints created after the resumable-collection update "
+                "can be resumed safely."
+            )
+    return trajectories
+
+
+def _atomic_write_trajectory_checkpoint(path: str, trajectories: list) -> None:
+    """Atomically replace a trajectory checkpoint after a completed batch."""
+    checkpoint_path = os.path.abspath(os.path.expanduser(path))
+    directory = os.path.dirname(checkpoint_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = f"{checkpoint_path}.tmp-{uuid.uuid4().hex}"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as writer:
+            json.dump(trajectories, writer, indent=2, ensure_ascii=False)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary_path, checkpoint_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def _restore_collection_state(trajectories: list) -> dict:
+    """Rebuild deduplication and monotonic ID/seed state from a checkpoint."""
+    seen_hashes = set()
+    unique_gamefiles = set()
+    for trajectory in trajectories:
+        if trajectory.get("won") is not True:
+            continue
+        identity_hash = _trajectory_identity_hash(trajectory)
+        trajectory["trajectory_hash"] = identity_hash
+        is_duplicate = identity_hash in seen_hashes
+        trajectory["is_duplicate_success"] = is_duplicate
+        if not is_duplicate:
+            seen_hashes.add(identity_hash)
+            gamefile = _normalize_gamefile_for_identity(
+                trajectory.get("gamefile")
+            )
+            if gamefile:
+                unique_gamefiles.add(gamefile)
+
+    return {
+        "seen_success_hashes": seen_hashes,
+        "unique_success_gamefiles": unique_gamefiles,
+        "unique_success_count": len(seen_hashes),
+        "next_episode_id": max(
+            (int(item["episode_id"]) for item in trajectories), default=-1
+        ) + 1,
+        "next_round_idx": max(
+            (int(item["round_idx"]) for item in trajectories), default=-1
+        ) + 1,
+        "next_seed": max(
+            (int(item["seed"]) for item in trajectories), default=0
+        ) + 1,
+    }
+
+
 def truncate_middle_text(text: str, max_chars: int, marker: str = "\n... [truncated] ...\n") -> str:
     if text is None:
         return ""
@@ -1548,8 +1625,19 @@ async def main():
         safe_run_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", run_tag)
         traj_file = _add_file_suffix(traj_file, safe_run_tag)
 
-    # Final safeguard: never overwrite an existing trajectory file.
-    if os.path.exists(traj_file):
+    resume_trajectory_file = os.environ.get(
+        "RESUME_TRAJECTORY_FILE", ""
+    ).strip()
+    if resume_trajectory_file:
+        if split != "train":
+            raise ValueError(
+                "RESUME_TRAJECTORY_FILE is only supported with SPLIT=train."
+            )
+        traj_file = os.path.abspath(os.path.expanduser(resume_trajectory_file))
+
+    # Final safeguard: never overwrite an existing trajectory file unless the
+    # user explicitly selected it as a resume checkpoint.
+    if not resume_trajectory_file and os.path.exists(traj_file):
         unique_tag = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
         traj_file = _add_file_suffix(traj_file, unique_tag)
 
@@ -1567,6 +1655,8 @@ async def main():
     
     logging.info(f"Saving trajectories to {traj_file}")
     logging.info(f"Saving statistics to {stats_file}")
+    if resume_trajectory_file:
+        logging.info(f"Resuming trajectories from {traj_file}")
 
     # -------- Parameters ----------
     max_steps = int(os.environ.get("MAX_STEPS", 50))
@@ -1679,11 +1769,46 @@ async def main():
             'action_changes_per_trajectory': [],  # Track action changes in each trajectory
         }
 
-    traj_items = []
-    seen_success_hashes = set()
-    unique_success_gamefiles = set()
-    unique_success_count = 0
+    if resume_trajectory_file:
+        traj_items = _load_trajectory_checkpoint(traj_file)
+    else:
+        traj_items = []
+    restored_state = _restore_collection_state(traj_items)
+    seen_success_hashes = restored_state["seen_success_hashes"]
+    unique_success_gamefiles = restored_state["unique_success_gamefiles"]
+    unique_success_count = restored_state["unique_success_count"]
+    episode_id_offset = restored_state["next_episode_id"]
+    round_idx_offset = restored_state["next_round_idx"]
+    collection_seed_start = (
+        restored_state["next_seed"]
+        if resume_trajectory_file and traj_items
+        else base_seed
+    )
     stop_collection = False
+    if resume_trajectory_file:
+        logging.info(
+            "Restored %d trajectories, %d unique successes, %d unique games; "
+            "continuing at episode_id=%d, round_idx=%d, seed=%d. "
+            "TEST_TIMES is the maximum number of additional rounds.",
+            len(traj_items),
+            unique_success_count,
+            len(unique_success_gamefiles),
+            episode_id_offset,
+            round_idx_offset,
+            collection_seed_start,
+        )
+        # Persist canonical duplicate annotations restored from the checkpoint.
+        _atomic_write_trajectory_checkpoint(traj_file, traj_items)
+    if _success_target_reached(
+        target_success_trajectories, unique_success_count
+    ):
+        logging.info(
+            "Checkpoint already contains %d unique successful trajectories, "
+            "meeting target %d; no new environments will be started.",
+            unique_success_count,
+            target_success_trajectories,
+        )
+        return
     if mem_type:
         logging.info(f"Saving to {traj_file}")
     else:
@@ -1691,7 +1816,11 @@ async def main():
 
     # ======================= Main Loop =======================
     for test_idx in range(test_times):
-        logging.info(f"\n========== Start test {test_idx} ==========")
+        global_round_idx = round_idx_offset + test_idx
+        logging.info(
+            f"\n========== Start test {global_round_idx} "
+            f"(additional round {test_idx + 1}/{test_times}) =========="
+        )
         start_time = time.time()
 
         # Round-level accumulators (aggregated across all batches)
@@ -1710,7 +1839,7 @@ async def main():
             current_batch_size = batch_end - batch_start
             batch_seed = _collection_batch_seed(
                 split,
-                base_seed,
+                collection_seed_start,
                 test_idx,
                 env_num,
                 batch_start,
@@ -1742,8 +1871,8 @@ async def main():
 
             batch_trajs = [
                 _new_trajectory_record(
-                    episode_id=test_idx * env_num + batch_start + i,
-                    round_idx=test_idx,
+                    episode_id=episode_id_offset + test_idx * env_num + batch_start + i,
+                    round_idx=global_round_idx,
                     seed=batch_seed + i,
                     gamefile=infos[i].get("extra.gamefile", ""),
                 )
@@ -2174,6 +2303,16 @@ async def main():
             # Accumulate this batch's trajectories into the round collection.
             round_trajs.extend(batch_trajs)
             attempted_this_round += current_batch_size
+            _atomic_write_trajectory_checkpoint(
+                traj_file, traj_items + round_trajs
+            )
+            logging.info(
+                "Checkpoint saved after round %d batch %d/%d (%d trajectories total).",
+                global_round_idx,
+                batch_idx + 1,
+                num_env_batches,
+                len(traj_items) + len(round_trajs),
+            )
 
             # Shut down this batch's Ray workers before starting the next batch.
             env_manager.envs.close()
@@ -2210,11 +2349,14 @@ async def main():
 
         traj_items.extend(round_trajs)
 
-        with open(traj_file, 'w') as writer:
-            json.dump(traj_items, writer, indent=2)
-        logging.info(f"Trajectories saved to {traj_file} after test {test_idx}")
+        _atomic_write_trajectory_checkpoint(traj_file, traj_items)
+        logging.info(
+            f"Trajectories saved to {traj_file} after test {global_round_idx}"
+        )
 
-        logging.info(f"Test {test_idx} overall success: {round_success_rate:.4f}")
+        logging.info(
+            f"Test {global_round_idx} overall success: {round_success_rate:.4f}"
+        )
 
         for task in TASKS + ["other"]:
             if task_total_cnt.get(task, 0) > 0:

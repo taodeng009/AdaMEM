@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -58,6 +60,9 @@ def _load_trajectory_collection_helpers():
         "_trajectory_identity_hash",
         "_record_unique_successes",
         "_success_target_reached",
+        "_load_trajectory_checkpoint",
+        "_atomic_write_trajectory_checkpoint",
+        "_restore_collection_state",
     }
     tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
     helpers = [
@@ -65,7 +70,13 @@ def _load_trajectory_collection_helpers():
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
-    namespace = {"hashlib": hashlib, "json": json, "re": re}
+    namespace = {
+        "hashlib": hashlib,
+        "json": json,
+        "os": os,
+        "re": re,
+        "uuid": uuid,
+    }
     exec(
         compile(ast.Module(body=helpers, type_ignores=[]), str(SCRIPT), "exec"),
         namespace,
@@ -291,6 +302,98 @@ class AlfworldCollectionConfigTest(unittest.TestCase):
         self.assertIn("_record_unique_successes(", source)
         self.assertIn("_success_target_reached(", source)
         self.assertIn("if stop_collection:\n            break", source)
+
+    def test_atomic_checkpoint_round_trip(self):
+        helpers = _load_trajectory_collection_helpers()
+        write_checkpoint = helpers["_atomic_write_trajectory_checkpoint"]
+        load_checkpoint = helpers["_load_trajectory_checkpoint"]
+        make_record = helpers["_new_trajectory_record"]
+        record = make_record(
+            episode_id=0,
+            round_idx=0,
+            seed=100,
+            gamefile="/data/train/game.tw-pddl",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "traj_train.json"
+            write_checkpoint(str(checkpoint), [record])
+            restored = load_checkpoint(str(checkpoint))
+
+            self.assertEqual(restored, [record])
+            self.assertEqual(list(Path(tmp).glob("*.tmp-*")), [])
+
+    def test_atomic_checkpoint_preserves_previous_file_on_replace_failure(self):
+        helpers = _load_trajectory_collection_helpers()
+        write_checkpoint = helpers["_atomic_write_trajectory_checkpoint"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "traj_train.json"
+            checkpoint.write_text('[{"existing": true}]', encoding="utf-8")
+            with mock.patch.object(
+                os, "replace", side_effect=OSError("simulated interruption")
+            ):
+                with self.assertRaisesRegex(OSError, "simulated interruption"):
+                    write_checkpoint(str(checkpoint), [{"replacement": True}])
+
+            self.assertEqual(
+                json.loads(checkpoint.read_text(encoding="utf-8")),
+                [{"existing": True}],
+            )
+            self.assertEqual(list(Path(tmp).glob("*.tmp-*")), [])
+
+    def test_resume_rejects_legacy_trajectory_without_required_metadata(self):
+        load_checkpoint = _load_trajectory_collection_helpers()[
+            "_load_trajectory_checkpoint"
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "legacy.json"
+            checkpoint.write_text(
+                json.dumps([{"won": True, "steps": []}]), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "missing required fields"):
+                load_checkpoint(str(checkpoint))
+
+    def test_resume_restores_deduplication_ids_rounds_and_seeds(self):
+        helpers = _load_trajectory_collection_helpers()
+        make_record = helpers["_new_trajectory_record"]
+        restore_state = helpers["_restore_collection_state"]
+
+        records = []
+        for episode_id, round_idx, seed, won, action in (
+            (0, 0, 200, True, "<action>look</action>"),
+            (1, 0, 201, True, "<action> LOOK </action>"),
+            (2, 1, 202, False, "<action>open fridge 1</action>"),
+        ):
+            record = make_record(
+                episode_id=episode_id,
+                round_idx=round_idx,
+                seed=seed,
+                gamefile="/data/train/same-game/game.tw-pddl",
+            )
+            record["won"] = won
+            record["steps"] = [{"curr_action": action}]
+            records.append(record)
+
+        state = restore_state(records)
+
+        self.assertEqual(state["unique_success_count"], 1)
+        self.assertEqual(len(state["seen_success_hashes"]), 1)
+        self.assertFalse(records[0]["is_duplicate_success"])
+        self.assertTrue(records[1]["is_duplicate_success"])
+        self.assertEqual(state["next_episode_id"], 3)
+        self.assertEqual(state["next_round_idx"], 2)
+        self.assertEqual(state["next_seed"], 203)
+
+    def test_main_loop_uses_resume_offsets_and_atomic_checkpoints(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"RESUME_TRAJECTORY_FILE"', source)
+        self.assertIn("episode_id_offset + test_idx * env_num", source)
+        self.assertIn("round_idx=global_round_idx", source)
+        self.assertIn("collection_seed_start", source)
+        self.assertIn("_load_trajectory_checkpoint(traj_file)", source)
+        self.assertIn("_restore_collection_state(traj_items)", source)
+        self.assertIn("_atomic_write_trajectory_checkpoint(", source)
 
 
 if __name__ == "__main__":
