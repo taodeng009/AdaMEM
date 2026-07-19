@@ -1,8 +1,11 @@
 """Regression tests for controllable ALFWorld trajectory collection."""
 
 import ast
+import hashlib
+import json
 import logging
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -45,6 +48,29 @@ def _load_collection_batch_seed():
         namespace,
     )
     return namespace["_collection_batch_seed"]
+
+
+def _load_trajectory_collection_helpers():
+    names = {
+        "_new_trajectory_record",
+        "_normalize_gamefile_for_identity",
+        "_normalize_action_for_identity",
+        "_trajectory_identity_hash",
+        "_record_unique_successes",
+        "_success_target_reached",
+    }
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
+    helpers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    namespace = {"hashlib": hashlib, "json": json, "re": re}
+    exec(
+        compile(ast.Module(body=helpers, type_ignores=[]), str(SCRIPT), "exec"),
+        namespace,
+    )
+    return namespace
 
 
 class AlfworldCollectionConfigTest(unittest.TestCase):
@@ -180,6 +206,91 @@ class AlfworldCollectionConfigTest(unittest.TestCase):
         )
         self.assertIsInstance(seed_keyword.value, ast.Name)
         self.assertEqual(seed_keyword.value.id, "batch_seed")
+
+    def test_new_trajectory_records_traceable_episode_metadata(self):
+        helpers = _load_trajectory_collection_helpers()
+        record = helpers["_new_trajectory_record"](
+            episode_id=17,
+            round_idx=2,
+            seed=101,
+            gamefile="/data/alfworld/game.tw-pddl",
+        )
+
+        self.assertEqual(record["episode_id"], 17)
+        self.assertEqual(record["round_idx"], 2)
+        self.assertEqual(record["seed"], 101)
+        self.assertEqual(record["gamefile"], "/data/alfworld/game.tw-pddl")
+        self.assertIsNone(record["won"])
+        self.assertEqual(record["steps"], [])
+
+    def test_duplicate_successes_are_annotated_and_not_counted_twice(self):
+        helpers = _load_trajectory_collection_helpers()
+        make_record = helpers["_new_trajectory_record"]
+        record_successes = helpers["_record_unique_successes"]
+
+        def successful_record(episode_id, action):
+            record = make_record(
+                episode_id=episode_id,
+                round_idx=0,
+                seed=episode_id + 1,
+                gamefile="/data/alfworld/same-game/game.tw-pddl",
+            )
+            record["won"] = True
+            record["steps"] = [{"curr_action": action}]
+            return record
+
+        first = successful_record(0, "<action>Open Fridge 1</action>")
+        duplicate = successful_record(1, "<action> open   fridge 1 </action>")
+        different = successful_record(2, "<action>go to fridge 1</action>")
+        failed = successful_record(3, "<action>open fridge 1</action>")
+        failed["won"] = False
+        seen = set()
+
+        accepted = record_successes(
+            [first, duplicate, different, failed], seen
+        )
+
+        self.assertEqual(accepted, 2)
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(first["is_duplicate_success"])
+        self.assertTrue(duplicate["is_duplicate_success"])
+        self.assertFalse(different["is_duplicate_success"])
+        self.assertNotIn("trajectory_hash", failed)
+
+    def test_missing_gamefile_does_not_merge_unrelated_episodes(self):
+        helpers = _load_trajectory_collection_helpers()
+        make_record = helpers["_new_trajectory_record"]
+        record_successes = helpers["_record_unique_successes"]
+        records = []
+        for episode_id in (10, 11):
+            record = make_record(
+                episode_id=episode_id,
+                round_idx=0,
+                seed=episode_id,
+                gamefile="",
+            )
+            record["won"] = True
+            record["steps"] = [{"curr_action": "<action>look</action>"}]
+            records.append(record)
+
+        self.assertEqual(record_successes(records, set()), 2)
+
+    def test_success_target_is_optional_and_inclusive(self):
+        reached = _load_trajectory_collection_helpers()[
+            "_success_target_reached"
+        ]
+        self.assertFalse(reached(0, 500))
+        self.assertFalse(reached(200, 199))
+        self.assertTrue(reached(200, 200))
+        self.assertTrue(reached(200, 203))
+
+    def test_main_loop_uses_metadata_deduplication_and_target_stop(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"TARGET_SUCCESS_TRAJECTORIES"', source)
+        self.assertIn("_new_trajectory_record(", source)
+        self.assertIn("_record_unique_successes(", source)
+        self.assertIn("_success_target_reached(", source)
+        self.assertIn("if stop_collection:\n            break", source)
 
 
 if __name__ == "__main__":

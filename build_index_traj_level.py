@@ -55,6 +55,8 @@ action_pattern = r"<action>(.*?)</action>"
 observation_pattern = r"your current observation is:\s*(.*?)\s*Your admissible actions"
 keys, values = [], [] 
 for item in items:
+    if correct_only and item.get("is_duplicate_success", False):
+        continue
     reward = "success" if item["won"] else "failure"
     if correct_only and reward == "failure":
         continue

@@ -156,6 +156,9 @@ Set `MEM_TYPE` to any value from the table above. Omit `MEM_TYPE` (or set it emp
 | `MEMORY_MODEL_NAME` | — | Index namespace/source trajectory model; not a serving endpoint |
 | `RETRIEVAL_TOPK` | `1` | Number of retrieved experiences *k* |
 | `OPENAI_BASE_IP_ADDR` | `127.0.0.1` | vLLM server host:port |
+| `TEST_TIMES` | `1000` for train, `3` for eval | Maximum collection/evaluation rounds |
+| `BASE_SEED` | `1` | Base seed for reproducible, non-overlapping training episodes |
+| `TARGET_SUCCESS_TRAJECTORIES` | `0` | Training-only unique-success target; `0` disables early stopping |
 
 ### 3. STEP-MFT Training
 

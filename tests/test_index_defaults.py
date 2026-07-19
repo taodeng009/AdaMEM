@@ -59,6 +59,20 @@ class IndexDefaultTest(unittest.TestCase):
                 self.assertTrue(calls_resolver)
                 self.assertTrue(has_all_trajectories_flag)
 
+    def test_success_index_builders_skip_annotated_duplicates(self):
+        repository_root = Path(__file__).resolve().parents[1]
+        for script_name in (
+            "build_index.py",
+            "build_index_traj_level.py",
+            "build_index_reasoningbank.py",
+        ):
+            source = (repository_root / script_name).read_text(encoding="utf-8")
+            with self.subTest(script_name=script_name):
+                self.assertIn(
+                    'correct_only and item.get("is_duplicate_success", False)',
+                    source,
+                )
+
     def test_alfworld_runtime_uses_shared_default(self):
         repository_root = Path(__file__).resolve().parents[1]
         for relative_path in (

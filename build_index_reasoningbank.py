@@ -94,6 +94,8 @@ async def main():
     keys, values = [], [] 
     prompts = []
     for item in items:
+        if correct_only and item.get("is_duplicate_success", False):
+            continue
         task_instr = item["steps"][0]["curr_prompt"]
         reward = "success" if item["won"] else "failure"
         if correct_only and reward == "failure":

@@ -91,6 +91,73 @@ def _collection_batch_seed(
     return base_seed + round_idx * env_num + batch_start
 
 
+def _new_trajectory_record(
+    *, episode_id: int, round_idx: int, seed: int, gamefile
+) -> dict:
+    """Create one traceable ALFWorld episode record."""
+    return {
+        "episode_id": int(episode_id),
+        "round_idx": int(round_idx),
+        "seed": int(seed),
+        "gamefile": str(gamefile or ""),
+        "won": None,
+        "steps": [],
+        "timing_per_step": [],
+    }
+
+
+def _normalize_gamefile_for_identity(gamefile) -> str:
+    return str(gamefile or "").strip().replace("\\", "/")
+
+
+def _normalize_action_for_identity(action) -> str:
+    text = str(action or "")
+    match = re.search(r"<action>(.*?)</action>", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        text = match.group(1)
+    return " ".join(text.split()).strip().lower()
+
+
+def _trajectory_identity_hash(trajectory: dict) -> str:
+    """Hash a task plus its executed semantic action sequence."""
+    gamefile = _normalize_gamefile_for_identity(trajectory.get("gamefile"))
+    # Avoid treating unrelated episodes as duplicates if an environment ever
+    # fails to expose its gamefile.
+    task_identity = gamefile or f"episode:{trajectory.get('episode_id', '')}"
+    actions = [
+        _normalize_action_for_identity(step.get("curr_action"))
+        for step in trajectory.get("steps", [])
+        if step.get("curr_action") not in (None, "None")
+    ]
+    payload = json.dumps(
+        {"task": task_identity, "actions": actions},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _record_unique_successes(trajectories, seen_hashes: set) -> int:
+    """Annotate successful trajectories and return the number newly accepted."""
+    newly_accepted = 0
+    for trajectory in trajectories:
+        if trajectory.get("won") is not True:
+            continue
+        identity_hash = _trajectory_identity_hash(trajectory)
+        trajectory["trajectory_hash"] = identity_hash
+        is_duplicate = identity_hash in seen_hashes
+        trajectory["is_duplicate_success"] = is_duplicate
+        if not is_duplicate:
+            seen_hashes.add(identity_hash)
+            newly_accepted += 1
+    return newly_accepted
+
+
+def _success_target_reached(target: int, unique_success_count: int) -> bool:
+    return target > 0 and unique_success_count >= target
+
+
 def truncate_middle_text(text: str, max_chars: int, marker: str = "\n... [truncated] ...\n") -> str:
     if text is None:
         return ""
@@ -1505,6 +1572,15 @@ async def main():
     max_steps = int(os.environ.get("MAX_STEPS", 50))
     env_num = SPLIT2ENV_NUM[split] # 200
     base_seed = _parse_env_int("BASE_SEED", 1, minimum=0)
+    target_success_trajectories = _parse_env_int(
+        "TARGET_SUCCESS_TRAJECTORIES", 0, minimum=0
+    )
+    if split != "train" and target_success_trajectories > 0:
+        logging.warning(
+            "TARGET_SUCCESS_TRAJECTORIES only applies to SPLIT=train; ignoring it for %s.",
+            split,
+        )
+        target_success_trajectories = 0
     # Keep the historical defaults, but allow both training and evaluation runs
     # to be bounded explicitly.  Previously SPLIT=train always forced 1000
     # rounds and silently ignored TEST_TIMES.
@@ -1533,7 +1609,8 @@ async def main():
     num_env_batches = math.ceil(env_num / ENV_BATCH_SIZE)
     logging.info(
         "Run configuration: split=%s, rounds=%d, envs_per_round=%d, "
-        "max_task_attempts=%d, max_steps=%d, env_batch_size=%d, base_seed=%d",
+        "max_task_attempts=%d, max_steps=%d, env_batch_size=%d, base_seed=%d, "
+        "target_unique_successes=%d",
         split,
         test_times,
         env_num,
@@ -1541,6 +1618,7 @@ async def main():
         max_steps,
         ENV_BATCH_SIZE,
         base_seed,
+        target_success_trajectories,
     )
 
     def _maybe_restart_vllm_between_batches(batch_idx: int, num_batches: int) -> None:
@@ -1602,6 +1680,10 @@ async def main():
         }
 
     traj_items = []
+    seen_success_hashes = set()
+    unique_success_gamefiles = set()
+    unique_success_count = 0
+    stop_collection = False
     if mem_type:
         logging.info(f"Saving to {traj_file}")
     else:
@@ -1619,6 +1701,7 @@ async def main():
         round_requests = 0
         round_action_changes = 0
         round_trajs = []  # accumulates batch_trajs from every batch
+        attempted_this_round = 0
 
         # ======================= Batch Loop =======================
         for batch_idx in range(num_env_batches):
@@ -1657,7 +1740,15 @@ async def main():
                 trajectory_retrievals = [0] * current_batch_size
                 trajectory_action_changes = [0] * current_batch_size
 
-            batch_trajs = [{"won": None, "steps": [], "timing_per_step": [], "round_idx": test_idx} for i in range(current_batch_size)]
+            batch_trajs = [
+                _new_trajectory_record(
+                    episode_id=test_idx * env_num + batch_start + i,
+                    round_idx=test_idx,
+                    seed=batch_seed + i,
+                    gamefile=infos[i].get("extra.gamefile", ""),
+                )
+                for i in range(current_batch_size)
+            ]
 
             for step_idx in range(max_steps):
                 logging.info(f"Step {step_idx}; Dones ({np.array(env_dones).sum().item()}/{current_batch_size}); SR {overall_success_this_round.mean().item()}")
@@ -2036,6 +2127,10 @@ async def main():
                         won = bool(infos[i].get("won", False))
                         overall_success_this_round[batch_start + i] = won
                         batch_trajs[i]["won"] = won
+                        if not batch_trajs[i]["gamefile"]:
+                            batch_trajs[i]["gamefile"] = str(
+                                infos[i].get("extra.gamefile", "") or ""
+                            )
     
                         
                         # Save per-trajectory statistics
@@ -2064,15 +2159,48 @@ async def main():
                     logging.info("All environments finished early!")
                     break
 
+            newly_accepted = _record_unique_successes(
+                batch_trajs, seen_success_hashes
+            )
+            unique_success_count += newly_accepted
+            unique_success_gamefiles.update(
+                _normalize_gamefile_for_identity(traj["gamefile"])
+                for traj in batch_trajs
+                if traj.get("won") is True
+                and not traj.get("is_duplicate_success", False)
+                and traj.get("gamefile")
+            )
+
             # Accumulate this batch's trajectories into the round collection.
             round_trajs.extend(batch_trajs)
+            attempted_this_round += current_batch_size
 
             # Shut down this batch's Ray workers before starting the next batch.
             env_manager.envs.close()
             del env_manager
 
+            if target_success_trajectories > 0:
+                logging.info(
+                    "Unique successful trajectories: %d/%d "
+                    "(%d unique games; +%d this batch)",
+                    unique_success_count,
+                    target_success_trajectories,
+                    len(unique_success_gamefiles),
+                    newly_accepted,
+                )
+            if _success_target_reached(
+                target_success_trajectories, unique_success_count
+            ):
+                stop_collection = True
+                logging.info(
+                    "Reached target of %d unique successful trajectories; "
+                    "stopping before the next environment batch.",
+                    target_success_trajectories,
+                )
+                break
+
         # -------- Single round results --------
-        round_success_rate = overall_success_this_round.mean()
+        round_success_rate = overall_success_this_round[:attempted_this_round].mean()
         overall_success_rates.append(round_success_rate)
 
         # Track retrieval requests for this round
@@ -2101,11 +2229,21 @@ async def main():
             f"Test {test_idx} time elapsed: {time.time() - start_time:.2f}s\n"
         )
 
+        if stop_collection:
+            break
+
     # ======================= Final Summary =======================
     logging.info("=============== Final Summary ===============")
     logging.info(
-        f"Total tests: {test_times} | Envs / test: {env_num} | Total envs: {env_num * test_times}"
+        f"Total tests: {len(overall_success_rates)} | Envs / test: {env_num} | "
+        f"Total envs: {len(traj_items)}"
     )
+    if split == "train":
+        logging.info(
+            "Unique successful trajectories: %d | Unique successful games: %d",
+            unique_success_count,
+            len(unique_success_gamefiles),
+        )
     logging.info(
         f"Overall success avg ± std: "
         f"{100*np.mean(overall_success_rates):.1f} ± {100*np.std(overall_success_rates, ddof=1):.1f}"
