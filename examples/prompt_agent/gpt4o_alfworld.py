@@ -1489,7 +1489,14 @@ async def main():
     # -------- Parameters ----------
     max_steps = int(os.environ.get("MAX_STEPS", 50))
     env_num = SPLIT2ENV_NUM[split] # 200
-    test_times = 1000 if split == "train" else int(os.environ.get("TEST_TIMES", 3))
+    # Keep the historical defaults, but allow both training and evaluation runs
+    # to be bounded explicitly.  Previously SPLIT=train always forced 1000
+    # rounds and silently ignored TEST_TIMES.
+    test_times = _parse_env_int(
+        "TEST_TIMES",
+        1000 if split == "train" else 3,
+        minimum=1,
+    )
     env_name = "alfworld" 
 
     # Keywords for 6 subtasks
@@ -1508,6 +1515,16 @@ async def main():
     if ENV_BATCH_SIZE <= 0:
         ENV_BATCH_SIZE = env_num
     num_env_batches = math.ceil(env_num / ENV_BATCH_SIZE)
+    logging.info(
+        "Run configuration: split=%s, rounds=%d, envs_per_round=%d, "
+        "max_task_attempts=%d, max_steps=%d, env_batch_size=%d",
+        split,
+        test_times,
+        env_num,
+        test_times * env_num,
+        max_steps,
+        ENV_BATCH_SIZE,
+    )
 
     def _maybe_restart_vllm_between_batches(batch_idx: int, num_batches: int) -> None:
         """Optionally restart the vLLM server between episode batches.
