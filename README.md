@@ -31,6 +31,7 @@ A central challenge for language agents is utilizing past experience to adapt to
 | `reasoningbank` | Episode-level strategy retrieval ([ReasoningBank](https://arxiv.org/abs/2509.25140) baseline) |
 | `adamem-high` | Step-wise strategy synthesis — generates a *transient* strategy at each step the agent requests memory (**AdaMEM-HIGH**) |
 | `adamem-low` | Step-wise strategy synthesis with persistent strategy and agent-controlled refresh (**AdaMEM-LOW**) |
+| `adamem-low-static` | AdaMEM-LOW ablation that retrieves and synthesizes once at episode start, then reuses the initial strategy without refresh |
 | `adamem-max` | Generates a fresh strategy at *every* step unconditionally (**AdaMEM-MAX / ablation**) |
 | `adamem-max-without-trajectory-memory` | Strategy synthesis without retrieval (no long-term memory; ablation) |
 | `adamem-max-without-strategy-memory` | Raw trajectory injection at every step without synthesis (ablation) |

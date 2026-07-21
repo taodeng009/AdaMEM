@@ -327,6 +327,7 @@ STEP_STRATEGY_MEM_TYPES = [
     "adamem-max-without-trajectory-memory",
     "adamem-max-without-strategy-memory",
     "adamem-low",
+    "adamem-low-static",
 ]
 
 MEM_TYPES_WITH_RETRIEVAL_STATS = STEP_STRATEGY_MEM_TYPES
@@ -1589,6 +1590,101 @@ class Agent:
             )
             return direct_response, False, "", retrieval_info, timing_info
 
+    async def get_action_with_adamem_low_static(
+        self,
+        prompt: str,
+        env_manager,
+        env_idx: int,
+        current_obs_text: str,
+        recent_history: str = "",
+    ):
+        """Reuse AdaMEM-LOW's initial strategy without subsequent refreshes."""
+        current_strategy = self.active_strategies.get(env_idx, None)
+        if current_strategy is None:
+            # Keep the ablation controlled: initialization is exactly the same
+            # retrieval, synthesis, storage, and action path as AdaMEM-LOW.
+            return await self.get_action_with_adamem_low(
+                prompt,
+                env_manager,
+                env_idx,
+                current_obs_text,
+                recent_history,
+            )
+
+        timing_calls = []
+        token_calls = []
+        action_prompt = prompt + "\n\n" + ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY.format(
+            strategy=current_strategy
+        )
+        try:
+            final_response, action_time = await self.get_action_from_gpt(
+                action_prompt,
+                call_type="static_strategy_guided_action",
+                token_calls=token_calls,
+            )
+            timing_calls.append(
+                _timing_call("static_strategy_guided_action", "action", action_time)
+            )
+            final_action = extract_action_from_response(final_response)
+            retrieval_info = {
+                "direct_prompt": None,
+                "initial_response": final_response,
+                "initial_action": final_action,
+                "refresh_decision": False,
+                "refresh_reason": "Static strategy reuse",
+                "refresh_response": None,
+                "refresh_prompt": None,
+                "strategy_prompt": None,
+                "strategy_response": None,
+                "strategy": current_strategy,
+                "action_prompt": action_prompt,
+                "final_response": final_response,
+                "final_action": final_action,
+            }
+            timing_info = _attach_token_usage(
+                _summarize_timing_calls(timing_calls), token_calls
+            )
+            return (
+                final_response,
+                False,
+                "static_strategy_reused",
+                retrieval_info,
+                timing_info,
+            )
+        except Exception as e:
+            logging.warning(
+                f"Static strategy reuse failed for env {env_idx}: {e}. "
+                "Using direct action."
+            )
+            direct_prompt = prompt + "\n\n" + ALFWORLD_ACTION_INSTR
+            direct_response, direct_time = await self.get_action_from_gpt(
+                direct_prompt,
+                call_type="fallback_action",
+                token_calls=token_calls,
+            )
+            timing_calls.append(_timing_call("fallback_action", "action", direct_time))
+            direct_action = extract_action_from_response(direct_response)
+            retrieval_info = {
+                "direct_prompt": direct_prompt,
+                "initial_response": direct_response,
+                "initial_action": direct_action,
+                "refresh_decision": False,
+                "refresh_reason": "Static strategy fallback",
+                "refresh_response": None,
+                "refresh_prompt": None,
+                "strategy_prompt": None,
+                "strategy_response": None,
+                "strategy": current_strategy,
+                "action_prompt": action_prompt,
+                "final_response": direct_response,
+                "final_action": direct_action,
+                "error": str(e),
+            }
+            timing_info = _attach_token_usage(
+                _summarize_timing_calls(timing_calls), token_calls
+            )
+            return direct_response, False, "", retrieval_info, timing_info
+
 async def main():
     # -------- logging ----------
     log_dir = f"logs/alfworld/{MODEL_NAME.replace('/', '_')}"
@@ -2063,7 +2159,7 @@ async def main():
                         
                         logging.info(f"  Memory retrieval (direct every step): {num_requested}/{len(active_indices)} always retrieved")
                     
-                    elif mem_type == "adamem-low":
+                    elif mem_type in {"adamem-low", "adamem-low-static"}:
                         current_obs_texts = [obs["text"][i] for i in active_indices]
                         # Build recent history for each env (last 3 steps)
                         recent_histories = []
@@ -2082,8 +2178,13 @@ async def main():
                             ])
                             recent_histories.append(history_str)
                         
+                        low_action_method = (
+                            agent.get_action_with_adamem_low_static
+                            if mem_type == "adamem-low-static"
+                            else agent.get_action_with_adamem_low
+                        )
                         tasks = [
-                            agent.get_action_with_adamem_low(
+                            low_action_method(
                                 prompt,
                                 env_manager,
                                 batch_start + idx,
@@ -2109,7 +2210,8 @@ async def main():
                         retrieval_stats['total_steps'] += len(active_indices)
                         retrieval_stats['total_requests'] += num_requested
                         
-                        # For reuse, refreshes are retrievals, no action_changes
+                        # Retrieval events are tracked uniformly; static mode
+                        # can only retrieve during initial strategy creation.
                         round_action_changes += 0
                         retrieval_stats['total_action_changes'] += 0
                         
@@ -2120,7 +2222,13 @@ async def main():
                                 trajectory_retrievals[idx] += 1
                             # No action_changes for reuse
                         
-                        logging.info(f"  Memory retrieval (strategy reuse): {num_requested}/{len(active_indices)} refreshed")
+                        if mem_type == "adamem-low-static":
+                            logging.info(
+                                f"  Memory retrieval (static strategy): "
+                                f"{num_requested}/{len(active_indices)} initialized"
+                            )
+                        else:
+                            logging.info(f"  Memory retrieval (strategy reuse): {num_requested}/{len(active_indices)} refreshed")
                     
                     else:
                         # Original logic for other memory types (no memory or simple retrieval)
@@ -2221,7 +2329,7 @@ async def main():
                                 step_item["action_prompt"] = retrieval_infos[i]["action_prompt"]
                                 step_item["final_response"] = retrieval_infos[i]["final_response"]
                                 step_item["final_action"] = retrieval_infos[i].get("final_action")
-                            elif mem_type == "adamem-low":
+                            elif mem_type in {"adamem-low", "adamem-low-static"}:
                                 step_item["direct_prompt"] = retrieval_infos[i]["direct_prompt"]
                                 step_item["initial_response"] = retrieval_infos[i]["initial_response"]
                                 step_item["initial_action"] = retrieval_infos[i]["initial_action"]
@@ -2447,13 +2555,23 @@ async def main():
                 f"Strategy reuse rate: {reuse_rate:.4f} "
                 f"({retrieval_stats['total_steps'] - retrieval_stats['total_requests']}/{retrieval_stats['total_steps']})"
             )
+        elif mem_type == "adamem-low-static":
+            reuse_rate = 1 - retrieval_rate
+            logging.info(
+                f"Initial strategy retrieval rate: {retrieval_rate:.4f} "
+                f"({retrieval_stats['total_requests']}/{retrieval_stats['total_steps']})"
+            )
+            logging.info(
+                f"Static strategy reuse rate: {reuse_rate:.4f} "
+                f"({retrieval_stats['total_steps'] - retrieval_stats['total_requests']}/{retrieval_stats['total_steps']})"
+            )
         else:
             logging.info(
                 f"Memory retrieval rate: {retrieval_rate:.4f} "
                 f"({retrieval_stats['total_requests']}/{retrieval_stats['total_steps']})"
             )
         
-        if mem_type != "adamem-low":
+        if mem_type not in {"adamem-low", "adamem-low-static"}:
             logging.info(
                 f"Action change rate (when memory retrieved): {action_change_rate:.4f} "
                 f"({retrieval_stats['total_action_changes']}/{retrieval_stats['total_requests']})"

@@ -66,17 +66,56 @@ def _load_low_method(*, should_refresh):
     return namespace["get_action_with_adamem_low"]
 
 
+def _load_low_static_method():
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"), filename=str(SCRIPT))
+    timing_helpers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {
+            "_timing_call",
+            "_summarize_timing_calls",
+            "_set_wall_clock_time",
+            "_attach_token_usage",
+        }
+    ]
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "get_action_with_adamem_low_static"
+    )
+    namespace = {
+        "ALFWORLD_ACTION_INSTR": "direct action",
+        "ALFWORLD_TEMPLATE_ACTION_FROM_STRATEGY": "static strategy={strategy}",
+        "extract_action_from_response": lambda response: "test action",
+        "logging": logging,
+        "summarize_token_calls": summarize_token_calls,
+    }
+    exec(
+        compile(
+            ast.Module(body=[*timing_helpers, method], type_ignores=[]),
+            str(SCRIPT),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["get_action_with_adamem_low_static"]
+
+
 def _is_adamem_low_branch(node: ast.If) -> bool:
     test = node.test
-    return (
+    if not (
         isinstance(test, ast.Compare)
         and isinstance(test.left, ast.Name)
         and test.left.id == "mem_type"
-        and any(
-            isinstance(comparator, ast.Constant)
-            and comparator.value == "adamem-low"
-            for comparator in test.comparators
-        )
+    ):
+        return False
+    return any(
+        isinstance(value, ast.Constant) and value.value == "adamem-low"
+        for comparator in test.comparators
+        for value in ast.walk(comparator)
     )
 
 
@@ -142,6 +181,7 @@ class AdaMemLowRegressionTest(unittest.TestCase):
             "get_action_with_adamem_max_without_trajectory",
             "get_action_with_adamem_max_without_strategy",
             "get_action_with_adamem_low",
+            "get_action_with_adamem_low_static",
         }
         methods = {
             node.name: node
@@ -298,6 +338,92 @@ class AdaMemLowCallCountTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result[4]["calls"]), 4)
         self.assertEqual(result[4]["token_usage"]["total_tokens"], 48)
 
+
+class AdaMemLowStaticCallCountTest(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_step_delegates_to_existing_low_path(self):
+        method = _load_low_static_method()
+        sentinel = ("initial response", True, "initial_strategy_generation", {}, {})
+
+        class FakeAgent:
+            active_strategies = {}
+            delegated_args = None
+
+            async def get_action_with_adamem_low(self, *args):
+                self.delegated_args = args
+                return sentinel
+
+        agent = FakeAgent()
+        result = await method(
+            agent,
+            "prompt",
+            "env-manager",
+            7,
+            "observation",
+            "recent history",
+        )
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(
+            agent.delegated_args,
+            ("prompt", "env-manager", 7, "observation", "recent history"),
+        )
+
+    async def test_subsequent_steps_reuse_strategy_without_refresh(self):
+        method = _load_low_static_method()
+
+        class FakeAgent:
+            active_strategies = {0: "initial fixed strategy"}
+            action_calls = []
+
+            async def get_action_from_gpt(self, prompt, **kwargs):
+                self.action_calls.append((prompt, kwargs["call_type"]))
+                kwargs["token_calls"].append(
+                    {
+                        "call_type": kwargs["call_type"],
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12,
+                        "usage_available": True,
+                    }
+                )
+                # A stray refresh tag must not trigger any refresh in static mode.
+                return "<action>go north</action><refresh_decision>yes</refresh_decision>", 0.25
+
+        agent = FakeAgent()
+        first_result = await method(agent, "prompt", None, 0, "observation")
+        result = await method(agent, "next prompt", None, 0, "next observation")
+
+        self.assertEqual(len(agent.action_calls), 2)
+        self.assertIn("initial fixed strategy", agent.action_calls[0][0])
+        self.assertTrue(
+            all(
+                call_type == "static_strategy_guided_action"
+                for _, call_type in agent.action_calls
+            )
+        )
+        self.assertEqual(agent.active_strategies[0], "initial fixed strategy")
+        self.assertFalse(first_result[1])
+        self.assertEqual(first_result[2], "static_strategy_reused")
+        self.assertFalse(result[1])
+        self.assertEqual(result[2], "static_strategy_reused")
+        self.assertFalse(result[3]["refresh_decision"])
+        self.assertIsNone(result[3]["refresh_prompt"])
+        self.assertIsNone(result[3]["strategy_prompt"])
+        self.assertEqual(result[3]["strategy"], "initial fixed strategy")
+        self.assertEqual(
+            [call["name"] for call in result[4]["calls"]],
+            ["static_strategy_guided_action"],
+        )
+        self.assertEqual(result[4]["token_usage"]["total_tokens"], 12)
+
+    def test_static_mode_is_registered_without_replacing_low(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        utils_source = (SCRIPT.parents[2] / "utils.py").read_text(encoding="utf-8")
+
+        self.assertIn('"adamem-low"', source)
+        self.assertIn('"adamem-low-static"', source)
+        self.assertIn("agent.get_action_with_adamem_low_static", source)
+        self.assertIn('"adamem-low-static"', utils_source)
 
 if __name__ == "__main__":
     unittest.main()

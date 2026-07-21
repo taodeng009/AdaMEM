@@ -103,7 +103,8 @@ def _get_file_paths(memory_type=None, split=None):
         return None, None, None
 
     ADAMEM_TYPES = {"adamem-high", "adamem-max", "adamem-max-without-trajectory-memory",
-                    "adamem-max-without-strategy-memory", "adamem-low"}
+                    "adamem-max-without-strategy-memory", "adamem-low",
+                    "adamem-low-static"}
     if selected_mem_type in ADAMEM_TYPES:
         index_path = f"retrieval_data/{dataset_name}/{base_model_safe}/train_hnsw.index"
         meta_path  = f"retrieval_data/{dataset_name}/{base_model_safe}/train_hnsw_meta.json"
